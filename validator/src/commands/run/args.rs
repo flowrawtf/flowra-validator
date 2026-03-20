@@ -1303,6 +1303,28 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("bundle_cu_reserve_pct")
+            .long("bundle-cu-reserve-pct")
+            .value_name("BUNDLE_CU_RESERVE_PCT")
+            .takes_value(true)
+            .default_value("15")
+            .help(
+                "Percentage of block CU budget to reserve for bundles (0-100). \
+                 Default is 15%.",
+            ),
+    )
+    .arg(
+        Arg::with_name("bundle_reserve_release_pct")
+            .long("bundle-reserve-release-pct")
+            .value_name("BUNDLE_RESERVE_RELEASE_PCT")
+            .takes_value(true)
+            .default_value("70")
+            .help(
+                "Percentage of bundle CU reservation to release back to general \
+                 transactions when no bundles are pending. Default is 70%.",
+            ),
+    )
+    .arg(
         Arg::with_name("shred_receiver_address")
             .long("shred-receiver-address")
             .value_name("SHRED_RECEIVER_ADDRESS")
