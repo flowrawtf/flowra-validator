@@ -765,6 +765,14 @@ pub fn execute(
 
     let tip_manager_config = tip_manager_config_from_matches(matches, voting_disabled);
 
+    let bundle_cu_reserve_pct: u64 = value_of(matches, "bundle_cu_reserve_pct").unwrap_or(15);
+    let bundle_reserve_release_pct: u64 =
+        value_of(matches, "bundle_reserve_release_pct").unwrap_or(70);
+    info!(
+        "Flowra bundle CU settings: reserve_pct={bundle_cu_reserve_pct}%, \
+         release_pct={bundle_reserve_release_pct}%"
+    );
+
     let block_engine_config = Arc::new(ArcSwap::from_pointee(BlockEngineConfig {
         block_engine_url: value_of(matches, "block_engine_url").unwrap_or_default(),
         disable_block_engine_autoconfig: matches.is_present("disable_block_engine_autoconfig"),
