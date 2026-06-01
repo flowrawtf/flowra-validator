@@ -596,7 +596,7 @@ impl BundleStage {
         let mut bundles = VecDeque::with_capacity(BUNDLE_WINDOW_SIZE.get());
 
         if bank.slot() != *last_tip_update_slot {
-            if Self::handle_tip_programs(
+            if let Err(e) = Self::handle_tip_programs(
                 bank,
                 bundle_account_locker,
                 consumer,
@@ -604,12 +604,11 @@ impl BundleStage {
                 cluster_info,
                 block_builder_fee_info,
                 consume_worker_metrics,
-            )
-            .is_err()
-            {
+            ) {
                 bundle_stage_metrics.increment_tip_programs_error(1);
-                error!("tip programs error, not processing bundles");
-                return;
+                warn!("tip programs error (continuing bundle processing): {:?}", e);
+                // Do NOT return — tip programs may not exist on devnet/testnet.
+                // Bundles are still valid and should be processed.
             }
 
             *last_tip_update_slot = bank.slot();
