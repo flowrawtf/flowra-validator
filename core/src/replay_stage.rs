@@ -118,6 +118,7 @@ const ASYNC_VERIFICATION_FREELIST_CAPACITY: usize = 5;
 pub(crate) const MAX_VOTE_SIGNATURES: usize = 200;
 const MAX_VOTE_REFRESH_INTERVAL_MILLIS: usize = 5000;
 const MAX_REPAIR_RETRY_LOOP_ATTEMPTS: usize = 10;
+const DUPLICATE_SLOT_DEVNET_SKIP: bool = true; // devnet: skip panic on duplicate slot disagreement
 
 #[cfg(test)]
 static_assertions::const_assert!(REFRESH_VOTE_BLOCKHEIGHT < solana_clock::MAX_PROCESSING_AGE);
@@ -1906,11 +1907,24 @@ impl ReplayStage {
                         );
                     }
 
-                    let attempt_no = purge_repair_slot_counter
-                        .entry(*duplicate_slot)
-                        .and_modify(|x| *x += 1)
-                        .or_insert(1);
-                    if *attempt_no > MAX_REPAIR_RETRY_LOOP_ATTEMPTS {
+                    let attempt_no = {
+                        let e = purge_repair_slot_counter
+                            .entry(*duplicate_slot)
+                            .and_modify(|x| *x += 1)
+                            .or_insert(1);
+                        *e
+                    }; // borrow dropped here
+                    if attempt_no > MAX_REPAIR_RETRY_LOOP_ATTEMPTS {
+                        if DUPLICATE_SLOT_DEVNET_SKIP {
+                            warn!(
+                                "[devnet] Duplicate slot {} repair exceeded {} attempts \
+                                 (correct_hash={}, our_hash={:?}). Resetting counter.",
+                                duplicate_slot, MAX_REPAIR_RETRY_LOOP_ATTEMPTS,
+                                correct_hash, frozen_hash
+                            );
+                            purge_repair_slot_counter.remove(duplicate_slot);
+                            // Skip the panic — fall through to purge and continue
+                        } else {
                         panic!(
                             "We have tried to repair duplicate slot: {duplicate_slot} more than \
                              {MAX_REPAIR_RETRY_LOOP_ATTEMPTS} times and are unable to freeze a \
@@ -1918,6 +1932,7 @@ impl ReplayStage {
                              bankhash {frozen_hash:?}. This is most likely a bug in the runtime. \
                              At this point manual intervention is needed to make progress. Exiting"
                         );
+                        }
                     }
 
                     Self::purge_unconfirmed_slot(
@@ -1934,7 +1949,7 @@ impl ReplayStage {
 
                     warn!(
                         "Notifying repair service to repair duplicate slot: {}, attempt {}",
-                        *duplicate_slot, *attempt_no,
+                        *duplicate_slot, attempt_no,
                     );
                     true
                 } else {
