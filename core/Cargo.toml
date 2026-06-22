@@ -91,6 +91,7 @@ serde = { workspace = true }
 serde_bytes = { workspace = true }
 signal-hook = { workspace = true }
 slab = { workspace = true }
+toml = { workspace = true }
 smallvec = { workspace = true }
 solana-account = { workspace = true }
 solana-accounts-db = { workspace = true }

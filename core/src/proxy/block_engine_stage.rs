@@ -787,6 +787,9 @@ impl BlockEngineStage {
         )
         .await?;
 
+        // Validator is the PBP policy authority: push our policy to the engine on connect.
+        Self::push_pbp_policy(&mut client, connection_timeout).await;
+
         Self::consume_bundle_and_packet_stream(
             client,
             (subscribe_bundles_stream, subscribe_packets_stream),
@@ -844,6 +847,10 @@ impl BlockEngineStage {
 
         info!("connected to packet and bundle stream");
 
+        // Track the PBP policy file so we can re-push to the engine when it changes.
+        let pbp_path = Self::pbp_config_path();
+        let mut pbp_mtime = pbp_path.as_deref().and_then(Self::pbp_mtime);
+
         while !exit.load(Ordering::Relaxed) {
             if BamConnectionState::from_u8(bam_enabled.load(Ordering::Relaxed))
                 == BamConnectionState::Connected
@@ -870,6 +877,15 @@ impl BlockEngineStage {
                 _ = metrics_and_auth_tick.tick() => {
                     block_engine_stats.report();
                     block_engine_stats = BlockEngineStageStats::default();
+
+                    // Hot-reload: if the validator's PBP file changed, re-push to the engine.
+                    if let Some(path) = pbp_path.as_deref() {
+                        let m = Self::pbp_mtime(path);
+                        if m.is_some() && m != pbp_mtime {
+                            pbp_mtime = m;
+                            Self::push_pbp_policy(&mut client, connection_timeout).await;
+                        }
+                    }
 
                     if cluster_info.id() != keypair.pubkey() {
                         return Err(ProxyError::AuthenticationConnectionError("validator identity changed".to_string()));
@@ -921,6 +937,89 @@ impl BlockEngineStage {
         }
 
         Ok(())
+    }
+
+    /// Path to the validator-owned PBP policy file, if configured via env.
+    /// The validator is the policy authority; it pushes this to the block engine.
+    fn pbp_config_path() -> Option<std::path::PathBuf> {
+        std::env::var("FLOWRA_PBP_CONFIG")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
+    fn pbp_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+
+    /// Parse the PBP TOML into a wire PbpPolicy message.
+    fn load_pbp_policy(path: &std::path::Path) -> Option<block_engine::PbpPolicy> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let val: toml::Value = toml::from_str(&content).ok()?;
+        let arr = |table: &str, key: &str| -> Vec<String> {
+            val.get(table)
+                .and_then(|t| t.get(key))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // E3: parse the `[[category_quotas]]` array-of-tables (name, pct, program_ids).
+        let category_quotas: Vec<block_engine::CategoryQuota> = val
+            .get("category_quotas")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|q| {
+                        let name = q.get("name").and_then(|v| v.as_str())?.to_string();
+                        let pct = q.get("pct").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
+                        let program_ids = q
+                            .get("program_ids")
+                            .and_then(|v| v.as_array())
+                            .map(|p| p.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        Some(block_engine::CategoryQuota { name, pct, program_ids })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Some(block_engine::PbpPolicy {
+            allow_aggressive_mev: val
+                .get("policy")
+                .and_then(|p| p.get("allow_aggressive_mev"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            searcher_whitelist: arr("searcher_whitelist", "pubkeys"),
+            address_blacklist: arr("address_blacklist", "addresses"),
+            program_blacklist: arr("program_blacklist", "program_ids"),
+            // E1/E5, E4, E3 — new programmable-policy knobs.
+            program_allowlist: arr("program_allowlist", "program_ids"),
+            force_priority_searchers: arr("force_priority", "searchers"),
+            category_quotas,
+        })
+    }
+
+    /// Push the validator's current PBP policy to the block engine (best-effort).
+    async fn push_pbp_policy(
+        client: &mut BlockEngineValidatorClient<InterceptedService<Channel, AuthInterceptor>>,
+        connection_timeout: &Duration,
+    ) {
+        let Some(path) = Self::pbp_config_path() else {
+            return;
+        };
+        let Some(policy) = Self::load_pbp_policy(&path) else {
+            warn!("FLOWRA_PBP_CONFIG set but policy at {path:?} could not be loaded");
+            return;
+        };
+        match timeout(*connection_timeout, client.provide_pbp_policy(policy)).await {
+            Ok(Ok(_)) => info!("pushed PBP policy to block engine from {path:?}"),
+            Ok(Err(status)) => warn!("provide_pbp_policy failed: {status}"),
+            Err(_) => warn!("provide_pbp_policy timed out"),
+        }
     }
 
     fn handle_block_engine_bundles(
