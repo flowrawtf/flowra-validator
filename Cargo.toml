@@ -109,6 +109,7 @@ members = [
     "syscalls",
     "syscalls/gen-syscall-list",
     "test-validator",
+    "tip-distributor",
     "tls-utils",
     "tokens",
     "tps-client",
