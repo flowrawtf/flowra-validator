@@ -396,6 +396,11 @@ impl Tpu {
         let bundle_account_locker = BundleAccountLocker::default();
 
         let tip_manager = TipManager::new(tip_manager_config);
+        // FLOWRA PoC: expose the tip-payment PDAs to the scheduler's optional
+        // tip-aware priority calculation (`FLOWRA_TIP_AWARE_PRIORITY=1`).
+        crate::banking_stage::transaction_scheduler::receive_and_buffer::set_tip_accounts(
+            tip_manager.get_tip_accounts().iter().copied(),
+        );
         let filter_keys = {
             let mut filter_keys = filter_keys.as_ref().clone();
             filter_keys.insert(tip_manager.tip_payment_program_id());
