@@ -1,16 +1,150 @@
 use {
     agave_transaction_view::transaction_view::SanitizedTransactionView,
+    log::info,
     solana_cost_model::cost_model::CostModel,
     solana_fee::FeeFeatures,
+    solana_pubkey::Pubkey,
     solana_runtime::bank::{Bank, CollectorFeeDetails},
     solana_runtime_transaction::{
         runtime_transaction::RuntimeTransaction,
         sanitize_config::sanitize_config,
         transaction_meta::{TransactionConfiguration, TransactionMeta},
     },
+    solana_sdk_ids::system_program,
     solana_svm_transaction::svm_message::SVMStaticMessage,
     solana_transaction::sanitized::MessageHash,
+    std::{collections::HashSet, sync::OnceLock},
 };
+
+/// FLOWRA PoC: process-global set of tip-payment PDAs used by the optional
+/// tip-aware priority calculation. Populated once at validator boot where the
+/// `TipManager` is constructed.
+static TIP_ACCOUNTS: OnceLock<HashSet<Pubkey>> = OnceLock::new();
+
+/// Returns true if tip-aware priority is enabled via
+/// `FLOWRA_TIP_AWARE_PRIORITY=1`. The env check is cached after first use.
+fn tip_aware_priority_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("FLOWRA_TIP_AWARE_PRIORITY").is_ok_and(|value| value == "1"))
+}
+
+/// FLOWRA PoC: register the tip-payment PDAs for tip-aware priority.
+/// Subsequent calls are no-ops.
+pub fn set_tip_accounts(tip_accounts: impl IntoIterator<Item = Pubkey>) {
+    let tip_accounts: HashSet<Pubkey> = tip_accounts.into_iter().collect();
+    let num_tip_accounts = tip_accounts.len();
+    if TIP_ACCOUNTS.set(tip_accounts).is_ok() && tip_aware_priority_enabled() {
+        info!("FLOWRA tip-aware priority: enabled ({num_tip_accounts} tip accounts)");
+    }
+}
+
+/// Sum the lamports transferred to tip accounts by top-level System-Program
+/// `Transfer` instructions in `transaction`. Returns 0 if no static account key
+/// is a tip account.
+///
+/// Only static keys are inspected. `calculate_priority_and_cost` is also called
+/// on unresolved views by the pf-floor path, where lookup tables have not been
+/// loaded and there is nothing to resolve an ALT index against. A tip whose
+/// destination is carried in a lookup table is therefore not counted; the tip
+/// PDAs are a small, well-known set that senders pass directly.
+fn transaction_tip_lamports(
+    transaction: &impl SVMStaticMessage,
+    tip_accounts: &HashSet<Pubkey>,
+) -> u64 {
+    let account_keys = transaction.static_account_keys();
+    // Quick check: only walk instructions if a tip account is present at all.
+    if !account_keys.iter().any(|key| tip_accounts.contains(key)) {
+        return 0;
+    }
+
+    // `SystemInstruction::Transfer { lamports }` bincode encoding: 4-byte LE
+    // enum discriminant (2) followed by 8-byte LE lamports.
+    const TRANSFER_DISCRIMINANT: u32 = 2;
+    const TRANSFER_DATA_LEN: usize = 4 + core::mem::size_of::<u64>();
+    transaction
+        .program_instructions_iter()
+        .filter(|(program_id, _)| *program_id == &system_program::id())
+        .filter_map(|(_, instruction)| {
+            let data = instruction.data;
+            if data.len() < TRANSFER_DATA_LEN
+                || u32::from_le_bytes(data[0..4].try_into().unwrap()) != TRANSFER_DISCRIMINANT
+            {
+                return None;
+            }
+            // Destination is the second account of the transfer.
+            let destination_index = usize::from(*instruction.accounts.get(1)?);
+            let destination = account_keys.get(destination_index)?;
+            tip_accounts
+                .contains(destination)
+                .then(|| u64::from_le_bytes(data[4..TRANSFER_DATA_LEN].try_into().unwrap()))
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// FLOWRA PoC: anti-cannibalization damping mode for the tip term, selected by
+/// `FLOWRA_TIP_DAMPING` (only consulted when tip-aware priority is enabled).
+#[derive(Clone, Copy)]
+enum TipDamping {
+    /// Full linear tip contribution: `reward + tip`.
+    Off,
+    /// Diminishing returns: tip added in full up to the fee, excess damped by a
+    /// geometric-mean term so a tip that dwarfs the fee grows sub-linearly.
+    Sqrt,
+    /// Tip may boost priority up to `mult x` the real fee, no more.
+    Cap { mult: u64 },
+}
+
+/// Returns the tip-damping mode from `FLOWRA_TIP_DAMPING`. Parsed once.
+///
+/// - unset / `"off"` (or any unrecognized value) -> `Off` (byte-identical to
+///   the un-damped patch),
+/// - `"sqrt"` -> `Sqrt`,
+/// - `"cap"`  -> `Cap` with `mult` from `FLOWRA_TIP_DAMPING_CAP_MULT` (default 4).
+fn tip_damping_mode() -> TipDamping {
+    static MODE: OnceLock<TipDamping> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("FLOWRA_TIP_DAMPING").as_deref() {
+        Ok("sqrt") => TipDamping::Sqrt,
+        Ok("cap") => TipDamping::Cap {
+            mult: std::env::var("FLOWRA_TIP_DAMPING_CAP_MULT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(4),
+        },
+        _ => TipDamping::Off,
+    })
+}
+
+/// FLOWRA PoC: fold the MEV `tip` into the priority numerator alongside the
+/// pre-tip `reward` (priority_fee + 0.5*base_fee), applying the damping mode
+/// selected by `FLOWRA_TIP_DAMPING`. Pure and unit-testable via `combine_tip`.
+fn apply_tip(reward: u64, tip: u64) -> u64 {
+    combine_tip(tip_damping_mode(), reward, tip)
+}
+
+/// Core of [`apply_tip`], parameterized on `mode` so each branch is testable
+/// without touching the process-global env cache. All arithmetic saturates.
+fn combine_tip(mode: TipDamping, reward: u64, tip: u64) -> u64 {
+    match mode {
+        // Full linear tip: identical to the un-damped tip-aware patch.
+        TipDamping::Off => reward.saturating_add(tip),
+        // Add tip in full up to the fee; damp the excess-over-fee by
+        // `isqrt((tip - fee) * fee)`, which tends to fee-scaled sqrt growth so
+        // a tip that vastly exceeds the fee yields a much smaller boost.
+        TipDamping::Sqrt => {
+            let fee = reward;
+            let damped_tip = if tip <= fee {
+                tip
+            } else {
+                let excess = tip - fee;
+                fee.saturating_add(excess.saturating_mul(fee).isqrt())
+            };
+            reward.saturating_add(damped_tip)
+        }
+        // Tip can boost priority up to `mult x` the real fee, no more.
+        TipDamping::Cap { mult } => reward.saturating_add(tip.min(reward.saturating_mul(mult))),
+    }
+}
 
 /// Calculate priority and cost for a transaction:
 ///
@@ -42,9 +176,19 @@ pub(crate) fn calculate_priority_and_cost<Tx: TransactionMeta + SVMStaticMessage
         transaction_configuration.priority_fee_lamports,
         FeeFeatures::from(bank.feature_set.as_ref()),
     );
-    let reward = bank
+    let mut reward = bank
         .calculate_reward_and_burn_fee_details(&CollectorFeeDetails::from(fee_details))
         .get_deposit();
+
+    // FLOWRA PoC: fold MEV tip lamports into the priority numerator when
+    // `FLOWRA_TIP_AWARE_PRIORITY=1`. Off (unset/other) leaves the priority
+    // calculation byte-identical to stock behavior.
+    if tip_aware_priority_enabled() {
+        if let Some(tip_accounts) = TIP_ACCOUNTS.get() {
+            let tip = transaction_tip_lamports(transaction, tip_accounts);
+            reward = apply_tip(reward, tip);
+        }
+    }
 
     // We need a multiplier here to avoid rounding down too aggressively.
     // For many transactions, the cost will be greater than the fees in terms of raw lamports.
@@ -87,6 +231,7 @@ pub(crate) fn calculate_priority_from_bytes(bank: &Bank, data: &[u8]) -> Option<
 mod tests {
     use {
         super::*,
+
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
         solana_keypair::Keypair,
@@ -188,5 +333,35 @@ mod tests {
             calculate_priority_and_cost(&bank, &runtime_tx, &transaction_configuration);
 
         assert_eq!(from_bytes, from_typed);
+    }
+
+    #[test]
+    fn test_apply_tip_off_is_linear() {
+        // Off mode adds the tip in full, regardless of magnitude, and saturates.
+        assert_eq!(combine_tip(TipDamping::Off, 100, 0), 100);
+        assert_eq!(combine_tip(TipDamping::Off, 100, 50), 150);
+        assert_eq!(combine_tip(TipDamping::Off, 100, 1_000_000), 1_000_100);
+        assert_eq!(combine_tip(TipDamping::Off, u64::MAX, 1), u64::MAX);
+    }
+
+    #[test]
+    fn test_apply_tip_sqrt_dampens_excess() {
+        // At or below the fee, the tip is added in full (linear).
+        assert_eq!(combine_tip(TipDamping::Sqrt, 100, 40), 140);
+        assert_eq!(combine_tip(TipDamping::Sqrt, 100, 100), 200);
+        // Above the fee, the excess is damped: fee + isqrt((tip - fee) * fee).
+        // fee=100, tip=10_100 -> 100 + isqrt(10_000 * 100)=100+1000=1100, +reward=1_200.
+        assert_eq!(combine_tip(TipDamping::Sqrt, 100, 10_100), 1_200);
+        // A tip that dwarfs the fee yields far less than the linear reward + tip.
+        let linear = combine_tip(TipDamping::Off, 100, 1_000_000);
+        assert!(combine_tip(TipDamping::Sqrt, 100, 1_000_000) < linear);
+    }
+
+    #[test]
+    fn test_apply_tip_cap_clamps() {
+        // Tip boosts priority up to `mult x` the real fee, no more (reward=100, K=4 -> cap 400).
+        assert_eq!(combine_tip(TipDamping::Cap { mult: 4 }, 100, 200), 300); // below cap
+        assert_eq!(combine_tip(TipDamping::Cap { mult: 4 }, 100, 400), 500); // exactly at cap
+        assert_eq!(combine_tip(TipDamping::Cap { mult: 4 }, 100, 10_000), 500); // clamped to cap
     }
 }

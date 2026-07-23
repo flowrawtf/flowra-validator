@@ -56,6 +56,7 @@ use {
     tokio::sync::mpsc,
     tokio_util::sync::CancellationToken,
     transaction_scheduler::{
+        conflict_aware_scheduler::{ConflictAwareScheduler, ConflictAwareSchedulerConfig},
         greedy_scheduler::{GreedyScheduler, GreedySchedulerConfig},
         receive_and_buffer::TransactionViewReceiveAndBuffer,
     },
@@ -640,13 +641,29 @@ impl BankingStage {
         }
 
         // Both block production methods currently route to the greedy scheduler.
-        let scheduler = GreedyScheduler::new(
-            work_senders,
-            finished_work_receiver,
-            GreedySchedulerConfig::default(),
-            bundle_account_locker.clone(),
-        );
-        spawn_scheduler!(scheduler);
+        // FLOWRA PoC: `FLOWRA_SCHEDULER=conflict-aware` selects the
+        // conflict-aware scheduler; anything else keeps the default greedy
+        // scheduler. The two branches produce different concrete scheduler
+        // types, so each invokes `spawn_scheduler!` separately (only one branch
+        // runs, so the captured channels are moved exactly once).
+        if std::env::var("FLOWRA_SCHEDULER").as_deref() == Ok("conflict-aware") {
+            info!("FLOWRA PoC: using conflict-aware scheduler");
+            let scheduler = ConflictAwareScheduler::new(
+                work_senders,
+                finished_work_receiver,
+                ConflictAwareSchedulerConfig::default(),
+                bundle_account_locker.clone(),
+            );
+            spawn_scheduler!(scheduler);
+        } else {
+            let scheduler = GreedyScheduler::new(
+                work_senders,
+                finished_work_receiver,
+                GreedySchedulerConfig::default(),
+                bundle_account_locker.clone(),
+            );
+            spawn_scheduler!(scheduler);
+        }
 
         if let Some(bam_dependencies) = bam_dependencies {
             // Spawn BAM workers

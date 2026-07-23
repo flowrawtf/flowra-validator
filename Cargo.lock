@@ -11550,7 +11550,7 @@ checksum = "0ced92c60aa76ec4780a9d93f3bd64dfa916e1b998eacc6f1c110f3f444f02c9"
 
 [[package]]
 name = "solana-tip-distributor"
-version = "4.1.0-rc.1"
+version = "4.2.1"
 dependencies = [
  "agave-feature-set",
  "agave-snapshots",
@@ -11567,7 +11567,7 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
- "solana-account 4.3.0",
+ "solana-account 4.3.1",
  "solana-accounts-db",
  "solana-client",
  "solana-commitment-config",

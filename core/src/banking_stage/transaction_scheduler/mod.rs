@@ -1,4 +1,6 @@
 mod batch_id_generator;
+// FLOWRA PoC: conflict-aware scheduler, selected via FLOWRA_SCHEDULER env var.
+pub(crate) mod conflict_aware_scheduler;
 pub(crate) mod greedy_scheduler;
 mod in_flight_tracker;
 pub(crate) mod receive_and_buffer;
