@@ -36,11 +36,15 @@ use {
         runtime_transaction::RuntimeTransaction, sanitize_config::sanitize_config,
         transaction_meta::TransactionMeta, transaction_with_meta::TransactionWithMeta,
     },
+    solana_sdk_ids::system_program,
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransactionError,
-    std::{sync::Arc, time::Instant},
+    std::{
+        sync::{Arc, OnceLock},
+        time::Instant,
+    },
 };
 
 #[derive(Debug)]
