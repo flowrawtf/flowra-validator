@@ -724,12 +724,57 @@ fn transfer_with_compute_unit_price_and_padding_legacy(
 
     if let Some(compute_unit_price) = compute_unit_price {
         instructions.extend_from_slice(&[
-            ComputeBudgetInstruction::set_compute_unit_limit(TRANSFER_TRANSACTION_COMPUTE_UNIT),
+            // BENCH_TPS_CU_LIMIT overrides the requested CU limit so the cost
+            // model charges the block that amount — lets a light transfer load
+            // saturate block CU for pacing/scheduler experiments.
+            ComputeBudgetInstruction::set_compute_unit_limit(
+                std::env::var("BENCH_TPS_CU_LIMIT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(TRANSFER_TRANSACTION_COMPUTE_UNIT),
+            ),
             ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price),
         ])
     }
+    // BENCH_TPS_TIP_LAMPORTS + BENCH_TPS_TIP_ACCOUNT: append a System transfer of
+    // the given lamports to a Jito/Flowra tip PDA, so the tx carries an MEV tip
+    // that is invisible to the fee calculator (tests tip-aware priority).
+    if let Some(tip) = maybe_tip_instruction(&from_pubkey) {
+        instructions.push(tip);
+    }
+    // BENCH_TPS_BURNER_PROGRAM + BENCH_TPS_BURNER_ROUNDS: append a call to the
+    // CU-burner program so the tx consumes real compute units (~ rounds*cost),
+    // shrinking block capacity so modest TPS oversubscribes the block.
+    if let Some(burn) = maybe_burner_instruction() {
+        instructions.push(burn);
+    }
     let message = Message::new(&instructions, Some(&from_pubkey));
     Transaction::new(&[from_keypair], message, recent_blockhash).into()
+}
+
+fn maybe_tip_instruction(from_pubkey: &Pubkey) -> Option<solana_instruction::Instruction> {
+    let lamports: u64 = std::env::var("BENCH_TPS_TIP_LAMPORTS").ok()?.parse().ok()?;
+    let tip_account: Pubkey = std::env::var("BENCH_TPS_TIP_ACCOUNT")
+        .ok()?
+        .parse()
+        .expect("BENCH_TPS_TIP_ACCOUNT must be a base58 pubkey");
+    Some(system_instruction::transfer(from_pubkey, &tip_account, lamports))
+}
+
+fn maybe_burner_instruction() -> Option<solana_instruction::Instruction> {
+    let program: Pubkey = std::env::var("BENCH_TPS_BURNER_PROGRAM")
+        .ok()?
+        .parse()
+        .expect("BENCH_TPS_BURNER_PROGRAM must be a base58 pubkey");
+    let rounds: u32 = std::env::var("BENCH_TPS_BURNER_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8000);
+    Some(solana_instruction::Instruction::new_with_bytes(
+        program,
+        &rounds.to_le_bytes(),
+        vec![],
+    ))
 }
 
 fn transfer_with_compute_unit_price_and_padding_v1(
