@@ -17,7 +17,7 @@ use {
         },
         packet_bundle::VerifiedPacketBundle,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
-        tip_manager::TipManager,
+        tip_manager::{TipManager, TipManagers},
     },
     ahash::HashSet,
     arc_swap::ArcSwap,
@@ -341,7 +341,7 @@ impl BundleStage {
         replay_vote_sender: ReplayVoteSender,
         log_messages_bytes_limit: Option<usize>,
         exit: Arc<AtomicBool>,
-        tip_manager: TipManager,
+        tip_managers: TipManagers,
         bundle_account_locker: BundleAccountLocker,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
@@ -357,7 +357,7 @@ impl BundleStage {
             replay_vote_sender,
             log_messages_bytes_limit,
             exit,
-            tip_manager,
+            tip_managers,
             bundle_account_locker,
             block_builder_fee_info,
             prioritization_fee_cache,
@@ -380,7 +380,7 @@ impl BundleStage {
         replay_vote_sender: ReplayVoteSender,
         log_message_bytes_limit: Option<usize>,
         exit: Arc<AtomicBool>,
-        tip_manager: TipManager,
+        tip_managers: TipManagers,
         bundle_account_locker: BundleAccountLocker,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
@@ -409,7 +409,7 @@ impl BundleStage {
                     exit,
                     blacklisted_accounts,
                     bundle_account_locker,
-                    tip_manager,
+                    tip_managers,
                     block_builder_fee_info,
                     cluster_info,
                 );
@@ -428,7 +428,7 @@ impl BundleStage {
         exit: Arc<AtomicBool>,
         blacklisted_accounts: HashSet<Pubkey>,
         bundle_account_locker: BundleAccountLocker,
-        tip_manager: TipManager,
+        tip_managers: TipManagers,
         block_builder_fee_info: Arc<ArcSwap<BlockBuilderFeeInfo>>,
         cluster_info: Arc<ClusterInfo>,
     ) {
@@ -453,7 +453,7 @@ impl BundleStage {
                         &mut bundle_stage_metrics,
                         &mut last_tip_update_slot,
                         &block_builder_fee_info,
-                        &tip_manager,
+                        &tip_managers,
                         &cluster_info,
                         &consume_worker_metrics
                     ));
@@ -545,7 +545,7 @@ impl BundleStage {
         bundle_stage_metrics: &mut BundleStageLoopMetrics,
         last_tip_update_slot: &mut Slot,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
-        tip_manager: &TipManager,
+        tip_managers: &TipManagers,
         cluster_info: &Arc<ClusterInfo>,
         consume_worker_metrics: &ConsumeWorkerMetrics,
     ) {
@@ -561,7 +561,7 @@ impl BundleStage {
                     bundle_stage_metrics,
                     last_tip_update_slot,
                     block_builder_fee_info,
-                    tip_manager,
+                    tip_managers,
                     cluster_info,
                     consume_worker_metrics,
                 );
@@ -587,7 +587,7 @@ impl BundleStage {
         bundle_stage_metrics: &mut BundleStageLoopMetrics,
         last_tip_update_slot: &mut Slot,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
-        tip_manager: &TipManager,
+        tip_managers: &TipManagers,
         cluster_info: &Arc<ClusterInfo>,
         consume_worker_metrics: &ConsumeWorkerMetrics,
     ) {
@@ -596,18 +596,19 @@ impl BundleStage {
         let mut bundles = VecDeque::with_capacity(BUNDLE_WINDOW_SIZE.get());
 
         if bank.slot() != *last_tip_update_slot {
-            if let Err(e) = Self::handle_tip_programs(
+            let failures = Self::handle_tip_programs(
                 bank,
                 bundle_account_locker,
                 consumer,
-                tip_manager,
+                tip_managers,
                 cluster_info,
                 block_builder_fee_info,
                 consume_worker_metrics,
-            ) {
-                bundle_stage_metrics.increment_tip_programs_error(1);
-                warn!("tip programs error (continuing bundle processing): {:?}", e);
-                // Do NOT return — tip programs may not exist on devnet/testnet.
+            );
+            if failures > 0 {
+                bundle_stage_metrics.increment_tip_programs_error(failures as u64);
+                // Do NOT return — tip programs may not exist on devnet/testnet, and an
+                // upstream program we cannot crank must not stop us building the block.
                 // Bundles are still valid and should be processed.
             }
 
@@ -694,33 +695,84 @@ impl BundleStage {
         bank: &Arc<Bank>,
         bundle_account_locker: &BundleAccountLocker,
         consumer: &mut BundleConsumer,
-        tip_manager: &TipManager,
+        tip_managers: &TipManagers,
         cluster_info: &Arc<ClusterInfo>,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         consume_worker_metrics: &ConsumeWorkerMetrics,
-    ) -> BundleExecutionResult<()> {
+    ) -> usize {
         let keypair = cluster_info.keypair();
+        let bb_info = block_builder_fee_info.load();
+        let mut failures = 0usize;
 
-        Self::handle_initialize_tip_programs(
-            bank,
-            bundle_account_locker,
-            consumer,
-            tip_manager,
-            consume_worker_metrics,
-            &keypair,
-        )?;
+        // Programs are cranked independently: a program we cannot crank (wrong config, an
+        // upstream program we do not fully control) must not stop us cranking the others.
+        for tip_manager in tip_managers.iter() {
+            let program = tip_manager.tip_payment_program_id();
 
-        Self::handle_crank_tip_programs(
-            bank,
-            bundle_account_locker,
-            consumer,
-            tip_manager,
-            block_builder_fee_info,
-            consume_worker_metrics,
-            &keypair,
-        )?;
+            if let Err(e) = Self::handle_initialize_tip_programs(
+                bank,
+                bundle_account_locker,
+                consumer,
+                tip_manager,
+                consume_worker_metrics,
+                &keypair,
+            ) {
+                warn!("tip program {program} initialize failed: {e:?}");
+                failures += 1;
+                continue;
+            }
 
-        Ok(())
+            let steps = match tip_manager.get_crank_steps(bank, &keypair, &bb_info) {
+                Ok(steps) => steps,
+                Err(e) => {
+                    warn!("tip program {program} crank could not be built: {e:?}");
+                    failures += 1;
+                    continue;
+                }
+            };
+
+            for step in steps {
+                let _ = bundle_account_locker.lock_bundle(&step.txs, bank);
+                let max_ages: SmallVec<[MaxAge; 2]> = SmallVec::from_elem(
+                    MaxAge {
+                        sanitized_epoch: bank.epoch(),
+                        alt_invalidation_slot: bank.slot(),
+                    },
+                    step.txs.len(),
+                );
+                let output = consumer.process_and_record_aged_transactions(
+                    bank,
+                    &step.txs,
+                    &max_ages,
+                    MAX_BUNDLE_RETRY_DURATION,
+                );
+                let _ = bundle_account_locker.unlock_bundle(&step.txs, bank);
+                consume_worker_metrics.update_for_consume(&output);
+                consume_worker_metrics.set_has_data(true);
+
+                match Self::to_bundle_result(&output) {
+                    Ok(()) => debug!("tip program {program} crank step {} ok", step.label),
+                    Err(e) => {
+                        // The enum alone hides which transaction error actually fired, so
+                        // surface the commit results too — this is the only place they exist.
+                        warn!(
+                            "tip program {program} crank step {} failed: {e:?} results={:?}",
+                            step.label,
+                            output
+                                .execute_and_commit_transactions_output
+                                .commit_transactions_result
+                        );
+                        failures += 1;
+                        if step.blocking {
+                            // Later steps read what this one was supposed to write.
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        failures
     }
 
     fn handle_initialize_tip_programs(
@@ -770,56 +822,6 @@ impl BundleStage {
         );
         info!("initialize tip program output: {bundle_result:?}");
 
-        bundle_result
-    }
-
-    fn handle_crank_tip_programs(
-        bank: &Arc<Bank>,
-        bundle_account_locker: &BundleAccountLocker,
-        consumer: &mut BundleConsumer,
-        tip_manager: &TipManager,
-        block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
-        consume_worker_metrics: &ConsumeWorkerMetrics,
-        keypair: &Keypair,
-    ) -> BundleExecutionResult<()> {
-        let block_builder_fee_info = block_builder_fee_info.load();
-        let crank_tip_program_transactions = tip_manager
-            .get_tip_programs_crank_bundle(bank, keypair, &block_builder_fee_info)
-            .map_err(|e| {
-                warn!("tip programs crank error: {e:?}");
-                BundleExecutionError::TipError
-            })?;
-
-        if crank_tip_program_transactions.is_empty() {
-            return Ok(());
-        }
-
-        let max_age = MaxAge {
-            sanitized_epoch: bank.epoch(),
-            alt_invalidation_slot: bank.slot(),
-        };
-        // SmallVec 2: tip-manager crank bundle is at most init-distribution + change-receiver txs.
-        let max_ages: SmallVec<[MaxAge; 2]> =
-            SmallVec::from_elem(max_age, crank_tip_program_transactions.len());
-        let _ = bundle_account_locker.lock_bundle(&crank_tip_program_transactions, bank);
-        let output = consumer.process_and_record_aged_transactions(
-            bank,
-            &crank_tip_program_transactions,
-            &max_ages,
-            MAX_BUNDLE_RETRY_DURATION,
-        );
-        let _ = bundle_account_locker.unlock_bundle(&crank_tip_program_transactions, bank);
-
-        consume_worker_metrics.update_for_consume(&output);
-        consume_worker_metrics.set_has_data(true);
-        let bundle_result = Self::to_bundle_result(&output);
-        debug!(
-            "crank tip program output: {:?}",
-            output
-                .execute_and_commit_transactions_output
-                .commit_transactions_result
-        );
-        info!("crank tip program output: {bundle_result:?}");
         bundle_result
     }
 
@@ -1600,3 +1602,6 @@ mod tests {
         drop(verified_bundle_sender);
     }
 }
+
+
+

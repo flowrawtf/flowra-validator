@@ -411,7 +411,7 @@ pub struct ValidatorConfig {
     pub shred_retransmit_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
     /// Automatically detected multicast destination for leader shreds.
     pub multicast_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
-    pub tip_manager_config: TipManagerConfig,
+    pub tip_manager_configs: Vec<TipManagerConfig>,
     pub bam_url: Arc<ArcSwap<Option<String>>>,
     /// Skips automatic multicast route detection and multicast receiver updates.
     pub disable_multicast_shred_check: bool,
@@ -507,7 +507,7 @@ impl ValidatorConfig {
                 ShredReceiverAddresses::new(),
             )),
             multicast_receiver_address: Arc::new(ArcSwap::from_pointee(None)),
-            tip_manager_config: TipManagerConfig::default(),
+            tip_manager_configs: vec![TipManagerConfig::default()],
             bam_url: Arc::new(ArcSwap::from_pointee(None)),
             disable_multicast_shred_check: false,
         }
@@ -1757,7 +1757,7 @@ impl Validator {
             votor_event_sender.clone(),
             config.block_engine_config.clone(),
             config.relayer_config.clone(),
-            config.tip_manager_config.clone(),
+            config.tip_manager_configs.clone(),
             shredstream_receiver_address,
             config.shred_receiver_addresses.clone(),
             bam_shred_receiver_addresses,

@@ -7,7 +7,7 @@ use {
     },
     crate::{
         bundle_stage::bundle_account_locker::BundleAccountLocker,
-        proxy::block_engine_stage::BlockBuilderFeeInfo, tip_manager::TipManager,
+        proxy::block_engine_stage::BlockBuilderFeeInfo, tip_manager::TipManagers,
     },
     arc_swap::ArcSwap,
     itertools::Itertools,
@@ -110,7 +110,7 @@ pub struct LeaderProcessedTransactionCounts {
 
 #[derive(Clone)]
 pub struct TipProcessingDependencies {
-    pub tip_manager: TipManager,
+    pub tip_managers: TipManagers,
     pub last_tip_updated_slot: Arc<Mutex<u64>>,
     pub block_builder_fee_info: Arc<ArcSwap<BlockBuilderFeeInfo>>,
     pub cluster_info: Arc<ClusterInfo>,

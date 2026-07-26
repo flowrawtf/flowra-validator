@@ -8,7 +8,10 @@ use {
             TransactionResult,
         },
     },
-    crate::banking_stage::consumer::{ExecutionFlags, RetryableIndex, TipProcessingDependencies},
+    crate::{
+        banking_stage::consumer::{ExecutionFlags, RetryableIndex, TipProcessingDependencies},
+        bundle_stage::bundle_account_locker::BundleAccountLocker,
+    },
     crossbeam_channel::{Receiver, SendError, Sender, TryRecvError},
     jito_protos::proto::bam_types::TransactionCommittedResult,
     solana_poh::poh_recorder::{LeaderState, SharedLeaderState},
@@ -208,7 +211,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
     /// info is unavailable.
     fn maybe_run_tip_programs(&self, bank: &Arc<Bank>, txs: &[impl TransactionWithMeta]) -> bool {
         let Some(TipProcessingDependencies {
-            tip_manager,
+            tip_managers,
             last_tip_updated_slot,
             block_builder_fee_info,
             cluster_info,
@@ -218,8 +221,9 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
             return true;
         };
 
-        // Return true if no tip accounts touched
-        let tip_accounts = tip_manager.get_tip_accounts();
+        // Return true if no tip accounts touched. The set spans every managed program, so
+        // a transaction paying an upstream engine's tip PDAs also triggers the crank.
+        let tip_accounts = tip_managers.get_tip_accounts();
         if !txs
             .iter()
             .flat_map(|tx| tx.account_keys().iter())
@@ -234,60 +238,69 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
         }
 
         let keypair = cluster_info.keypair();
-        let initialize_tip_programs_bundle =
-            tip_manager.get_initialize_tip_programs_bundle(bank, &keypair);
-        if let Ok(init_bundle) = initialize_tip_programs_bundle {
-            let result = self.consumer.process_and_record_transactions(
-                bank,
-                &init_bundle,
-                bundle_account_locker,
-                true,
-            );
-            if result
-                .execute_and_commit_transactions_output
-                .commit_transactions_result
-                .map_or(true, |results| {
-                    results
-                        .iter()
-                        .any(|r| matches!(r, CommitTransactionDetails::NotCommitted(_)))
-                })
-            {
-                return false;
-            }
-        }
-
         let block_builder_fee_info = block_builder_fee_info.load();
         if block_builder_fee_info.block_builder == Pubkey::default() {
             return false;
         }
-        match tip_manager.get_tip_programs_crank_bundle(bank, &keypair, &block_builder_fee_info) {
-            Ok(tip_crank_bundle) => {
-                let result = self.consumer.process_and_record_transactions(
-                    bank,
-                    &tip_crank_bundle,
-                    bundle_account_locker,
-                    true,
-                );
-                if result
-                    .execute_and_commit_transactions_output
-                    .commit_transactions_result
-                    .map_or(true, |results| {
-                        results
-                            .iter()
-                            .any(|r| matches!(r, CommitTransactionDetails::NotCommitted(_)))
-                    })
+
+        // Each program is cranked on its own; a program we cannot crank must not block the
+        // others, nor stop this transaction from being included.
+        let mut all_ok = true;
+        for tip_manager in tip_managers.iter() {
+            let program = tip_manager.tip_payment_program_id();
+
+            if let Ok(init_bundle) = tip_manager.get_initialize_tip_programs_bundle(bank, &keypair) {
+                if !init_bundle.is_empty()
+                    && !self.commit_upkeep(bank, &init_bundle, bundle_account_locker)
                 {
-                    return false;
+                    warn!("tip program {program} initialize did not commit");
+                    all_ok = false;
+                    continue;
                 }
             }
-            Err(e) => {
-                error!("error getting tip programs crank bundle: {e:?}");
-                // ignore this error for now so tips can get processed
+
+            let steps = match tip_manager.get_crank_steps(bank, &keypair, &block_builder_fee_info) {
+                Ok(steps) => steps,
+                Err(e) => {
+                    error!("tip program {program} crank could not be built: {e:?}");
+                    all_ok = false;
+                    continue;
+                }
+            };
+            for step in steps {
+                if !self.commit_upkeep(bank, &step.txs, bundle_account_locker) {
+                    warn!("tip program {program} crank step {} did not commit", step.label);
+                    all_ok = false;
+                    if step.blocking {
+                        break;
+                    }
+                }
             }
         }
 
         *last_tip_updated_slot_guard = bank.slot();
-        true
+        all_ok
+    }
+
+    /// Execute one tip-upkeep transaction group atomically; `true` if every transaction
+    /// committed.
+    fn commit_upkeep(
+        &self,
+        bank: &Arc<Bank>,
+        txs: &[impl TransactionWithMeta],
+        bundle_account_locker: &BundleAccountLocker,
+    ) -> bool {
+        let result =
+            self.consumer
+                .process_and_record_transactions(bank, txs, bundle_account_locker, true);
+        result
+            .execute_and_commit_transactions_output
+            .commit_transactions_result
+            .map_or(false, |results| {
+                results
+                    .iter()
+                    .all(|r| !matches!(r, CommitTransactionDetails::NotCommitted(_)))
+            })
     }
 
     /// Builds `FinishedConsumeWorkExtraInfo` from consume output for BAM responses.

@@ -1149,7 +1149,7 @@ impl TestValidator {
             accounts_db_config,
             runtime_config,
             enable_scheduler_bindings: config.enable_scheduler_bindings,
-            tip_manager_config: TipManagerConfig {
+            tip_manager_configs: vec![TipManagerConfig {
                 tip_payment_program_id: jito_tip_payment::id(),
                 tip_distribution_program_id: jito_tip_distribution::id(),
                 tip_distribution_account_config: TipDistributionAccountConfig {
@@ -1157,7 +1157,7 @@ impl TestValidator {
                     vote_account: vote_account_address,
                     commission_bps: 10,
                 },
-            },
+            }],
             bam_url: config.bam_url.clone(),
             ..ValidatorConfig::default_for_test()
         };
