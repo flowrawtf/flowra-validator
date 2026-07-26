@@ -1278,6 +1278,33 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("The public key of the tip-distribution program."),
     )
     .arg(
+        Arg::with_name("upstream_tip_payment_program_pubkey")
+            .long("upstream-tip-payment-program-pubkey")
+            .value_name("UPSTREAM_TIP_PAYMENT_PROGRAM_PUBKEY")
+            .takes_value(true)
+            .requires("upstream_tip_distribution_program_pubkey")
+            .help(
+                "Public key of a SECOND tip-payment program to crank each leader slot. Set \
+                 this when accepting bundles relayed from an upstream block engine: those \
+                 bundles tip that engine's tip accounts, which belong to a different \
+                 tip-payment program. Without cranking it, those tips are swept to \
+                 whichever validator cranks it next.",
+            ),
+    )
+    .arg(
+        Arg::with_name("upstream_tip_distribution_program_pubkey")
+            .long("upstream-tip-distribution-program-pubkey")
+            .value_name("UPSTREAM_TIP_DISTRIBUTION_PROGRAM_PUBKEY")
+            .takes_value(true)
+            .requires("upstream_tip_payment_program_pubkey")
+            .help(
+                "Public key of the tip-distribution program paired with \
+                 --upstream-tip-payment-program-pubkey. The tip distribution account is \
+                 created under this program using the same vote account, commission and \
+                 merkle-root upload authority as the primary set.",
+            ),
+    )
+    .arg(
         Arg::with_name("merkle_root_upload_authority")
             .long("merkle-root-upload-authority")
             .value_name("MERKLE_ROOT_UPLOAD_AUTHORITY")

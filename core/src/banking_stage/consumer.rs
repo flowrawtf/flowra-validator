@@ -7,7 +7,7 @@ use {
     },
     crate::{
         bundle_stage::bundle_account_locker::BundleAccountLocker,
-        proxy::block_engine_stage::BlockBuilderFeeInfo, tip_manager::TipManager,
+        proxy::block_engine_stage::BlockBuilderFeeInfo, tip_manager::TipManagers,
     },
     arc_swap::ArcSwap,
     solana_accounts_db::accounts::TransactionAccountLocksIterator,
@@ -115,7 +115,7 @@ pub struct LeaderProcessedTransactionCounts {
 
 #[derive(Clone)]
 pub struct TipProcessingDependencies {
-    pub tip_manager: TipManager,
+    pub tip_managers: TipManagers,
     pub last_tip_updated_bank: Arc<Mutex<Option<(Slot, BankId)>>>,
     pub block_builder_fee_info: Arc<ArcSwap<BlockBuilderFeeInfo>>,
     pub bam_enabled: Arc<AtomicU8>,

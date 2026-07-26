@@ -30,6 +30,7 @@ use {
     log::info,
     solana_clock::Slot,
     solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS,
+    solana_ledger::shred::get_data_shred_bytes_per_batch_typical,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     std::num::Saturating,
 };
@@ -40,6 +41,7 @@ pub(crate) struct ConflictAwareSchedulerConfig {
     pub target_scheduled_cus: u64,
     pub max_scanned_transactions_per_scheduling_pass: usize,
     pub target_transactions_per_batch: usize,
+    pub target_entry_bytes_per_batch: u64,
 }
 
 impl Default for ConflictAwareSchedulerConfig {
@@ -48,6 +50,9 @@ impl Default for ConflictAwareSchedulerConfig {
             target_scheduled_cus: MAX_BLOCK_UNITS / 4,
             max_scanned_transactions_per_scheduling_pass: 100_000,
             target_transactions_per_batch: TARGET_NUM_TRANSACTIONS_PER_BATCH,
+            // Same budget the greedy scheduler uses; see its
+            // DEFAULT_TARGET_ENTRY_BYTES_PER_BATCH for the 15% derivation.
+            target_entry_bytes_per_batch: get_data_shred_bytes_per_batch_typical() * 15 / 100,
         }
     }
 }
@@ -242,6 +247,16 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
                     max_age,
                     cost,
                 }) => {
+                    // Mirrors `greedy_scheduler`: flush the batch before it exceeds the
+                    // per-batch entry byte budget, which SIMD-0296's larger transactions
+                    // can reach well before the transaction count target does.
+                    let transaction_bytes = transaction.serialized_size() as u64;
+                    if self.common.batches.entry_bytes()[thread_id] + transaction_bytes
+                        > self.config.target_entry_bytes_per_batch
+                    {
+                        num_sent += self.common.send_batches()?;
+                    }
+
                     num_scheduled += 1;
                     self.common.batches.add_transaction_to_batch(
                         thread_id,
@@ -249,6 +264,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
                         transaction,
                         max_age,
                         cost,
+                        transaction_bytes,
                     );
                     budget = budget.saturating_sub(cost);
 
