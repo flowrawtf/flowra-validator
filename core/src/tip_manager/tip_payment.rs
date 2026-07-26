@@ -20,7 +20,13 @@ pub enum TipPaymentError {
 pub type TipPaymentResult<T> = std::result::Result<T, TipPaymentError>;
 
 /// https://github.com/jito-foundation/jito-programs/blob/8f55af0a9b31ac2192415b59ce2c47329ee255a2/mev-programs/programs/tip-payment/src/lib.rs#L715
+///
+/// Mirrors the on-chain account byte-for-byte. `borsh::try_from_slice` errors unless the
+/// whole buffer is consumed, so every field must be declared even when nothing reads it —
+/// `bumps` is load-bearing for deserialization, not leftover state. (Verified against
+/// mainnet: the account is 89 bytes = 8 discriminator + 32 + 32 + 8 + 9.)
 #[derive(BorshDeserialize)]
+#[allow(dead_code)]
 pub struct JitoTipPaymentConfig {
     /// The account claiming tips from the mev_payment accounts.
     tip_receiver: Pubkey,
@@ -85,13 +91,14 @@ impl JitoTipPaymentConfig {
         self.block_builder_commission_pct
     }
 
-    pub fn bumps(&self) -> &JitoTipPaymentInitBumps {
-        &self.bumps
-    }
 }
 
 /// https://github.com/jito-foundation/jito-programs/blob/8f55af0a9b31ac2192415b59ce2c47329ee255a2/mev-programs/programs/tip-payment/src/lib.rs#L362
+///
+/// Read only by borsh; see [`JitoTipPaymentConfig`]. The PDA bumps the validator actually
+/// uses are derived locally in `TipManager::new`, not taken from this account.
 #[derive(BorshDeserialize)]
+#[allow(dead_code)]
 pub struct JitoTipPaymentInitBumps {
     pub config: u8,
     pub tip_payment_account_0: u8,

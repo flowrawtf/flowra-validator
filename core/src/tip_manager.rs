@@ -373,95 +373,6 @@ impl TipManager {
         .unwrap())
     }
 
-    /// Builds a transaction that changes the current tip receiver to new_tip_receiver.
-    /// The on-chain program will transfer tips sitting in the tip accounts to the tip receiver
-    /// before changing ownership.
-    pub fn change_tip_receiver_and_block_builder_tx(
-        &self,
-        new_tip_receiver: &Pubkey,
-        bank: &Bank,
-        keypair: &Keypair,
-        block_builder: &Pubkey,
-        block_builder_commission: u64,
-        tip_payment_config: &JitoTipPaymentConfig,
-    ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
-        self.build_change_tip_receiver_and_block_builder_tx(
-            &tip_payment_config.tip_receiver(),
-            new_tip_receiver,
-            bank,
-            keypair,
-            &tip_payment_config.block_builder(),
-            block_builder,
-            block_builder_commission,
-        )
-    }
-
-    pub fn build_change_tip_receiver_and_block_builder_tx(
-        &self,
-        old_tip_receiver: &Pubkey,
-        new_tip_receiver: &Pubkey,
-        bank: &Bank,
-        keypair: &Keypair,
-        old_block_builder: &Pubkey,
-        block_builder: &Pubkey,
-        block_builder_commission: u64,
-    ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
-        let change_tip_ix = Instruction {
-            program_id: self.tip_payment_program_info.program_id,
-            data: ChangeTipReceiverInstruction::to_instruction_data(),
-            accounts: vec![
-                AccountMeta::new(self.tip_payment_program_info.config_pda_bump.0, false),
-                AccountMeta::new(*old_tip_receiver, false),
-                AccountMeta::new(*new_tip_receiver, false),
-                AccountMeta::new(*old_block_builder, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_0.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_1.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_2.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_3.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_4.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_5.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_6.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_7.0, false),
-                AccountMeta::new(keypair.pubkey(), true),
-            ],
-        };
-
-        let change_block_builder_ix = Instruction {
-            program_id: self.tip_payment_program_info.program_id,
-            data: ChangeBlockBuilderInstruction::to_instruction_data(block_builder_commission)?,
-            accounts: vec![
-                AccountMeta::new(self.tip_payment_program_info.config_pda_bump.0, false),
-                AccountMeta::new(*new_tip_receiver, false), // tip receiver will have just changed in previous ix
-                AccountMeta::new(*old_block_builder, false),
-                AccountMeta::new(*block_builder, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_0.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_1.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_2.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_3.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_4.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_5.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_6.0, false),
-                AccountMeta::new(self.tip_payment_program_info.tip_pda_7.0, false),
-                AccountMeta::new(keypair.pubkey(), true),
-            ],
-        };
-        let tx = VersionedTransaction::from(Transaction::new_signed_with_payer(
-            &[change_tip_ix, change_block_builder_ix],
-            Some(&keypair.pubkey()),
-            &[keypair],
-            bank.last_blockhash(),
-        ));
-        Ok(RuntimeTransaction::try_create(
-            tx,
-            MessageHash::Compute,
-            None,
-            bank,
-            bank.get_reserved_account_keys(),
-            true,
-        )
-        .unwrap())
-    }
-
     /// Return a bundle that is capable of calling the initialize instructions on the two tip payment programs
     /// This is mainly helpful for local development and shouldn't run on testnet and mainnet, assuming the
     /// correct TipManager configuration is set.
@@ -485,38 +396,220 @@ impl TipManager {
         Ok(transactions)
     }
 
-    pub fn get_tip_programs_crank_bundle(
+    /// The crank, decomposed into independently-executed steps.
+    ///
+    /// Bundles execute all-or-nothing, so putting every crank instruction in one bundle
+    /// makes the weakest instruction able to veto the rest — a rejected
+    /// `change_block_builder` would roll back the `initialize_tip_distribution_account`
+    /// alongside it, and since the TDA is derived from the *current* epoch, an epoch that
+    /// ends without one can never get it back. Each step therefore executes on its own.
+    ///
+    /// The steps still form a chain, because later ones read state earlier ones write:
+    /// `change_tip_receiver` may only point at a TDA that exists, and
+    /// `change_block_builder` constrains the passed tip receiver against the config that
+    /// `change_tip_receiver` just set. A failing step marked `blocking` therefore stops the
+    /// rest of *this* program's chain — but never another program's.
+    pub fn get_crank_steps(
         &self,
         bank: &Bank,
         keypair: &Keypair,
         block_builder_fee_info: &BlockBuilderFeeInfo,
-    ) -> Result<SmallVec<[RuntimeTransaction<SanitizedTransaction>; 2]>> {
-        // SmallVec 2: only init-distribution-account + change-receiver can be produced here.
-        let mut transactions = SmallVec::with_capacity(2);
+    ) -> Result<Vec<CrankStep>> {
+        let mut steps = Vec::with_capacity(3);
+
         if self.should_init_tip_distribution_account(bank) {
-            info!("should_init_tip_distribution_account=true");
-            transactions.push(self.initialize_tip_distribution_account_tx(bank, keypair)?);
+            info!(
+                "tip_distribution_account missing for epoch {} (program {}), initializing",
+                bank.epoch(),
+                self.tip_distribution_program_info.program_id
+            );
+            steps.push(CrankStep {
+                label: "init_tip_distribution_account",
+                // change_tip_receiver must not point at a TDA that failed to be created:
+                // tips swept there afterwards would land on an unowned address.
+                blocking: true,
+                txs: smallvec::smallvec![self.initialize_tip_distribution_account_tx(bank, keypair)?],
+            });
         }
 
-        let tip_payment_config = self.get_tip_payment_config_account(bank)?;
+        let cfg = self.get_tip_payment_config_account(bank)?;
         let my_tip_receiver = self.get_my_tip_distribution_pda(bank.epoch());
 
-        if tip_payment_config.tip_receiver() != my_tip_receiver
-            || tip_payment_config.block_builder() != block_builder_fee_info.block_builder
-            || tip_payment_config.block_builder_commission_pct()
-                != block_builder_fee_info.block_builder_commission
-        {
-            debug!("change_tip_receiver=true");
-            transactions.push(self.change_tip_receiver_and_block_builder_tx(
-                &my_tip_receiver,
-                bank,
-                keypair,
-                &block_builder_fee_info.block_builder,
-                block_builder_fee_info.block_builder_commission,
-                &tip_payment_config,
-            )?);
+        if cfg.tip_receiver() != my_tip_receiver {
+            steps.push(CrankStep {
+                label: "change_tip_receiver",
+                // change_block_builder re-checks the tip receiver against the config.
+                blocking: true,
+                txs: smallvec::smallvec![self.change_tip_receiver_tx(
+                    &cfg.tip_receiver(),
+                    &my_tip_receiver,
+                    &cfg.block_builder(),
+                    bank,
+                    keypair,
+                )?],
+            });
         }
 
-        Ok(transactions)
+        if cfg.block_builder() != block_builder_fee_info.block_builder
+            || cfg.block_builder_commission_pct() != block_builder_fee_info.block_builder_commission
+        {
+            steps.push(CrankStep {
+                label: "change_block_builder",
+                // Purely a fee-routing preference; nothing downstream depends on it, so a
+                // misconfigured block builder must not cost us the TDA or the receiver.
+                blocking: false,
+                txs: smallvec::smallvec![self.change_block_builder_tx(
+                    &my_tip_receiver,
+                    &cfg.block_builder(),
+                    &block_builder_fee_info.block_builder,
+                    block_builder_fee_info.block_builder_commission,
+                    bank,
+                    keypair,
+                )?],
+            });
+        }
+
+        Ok(steps)
+    }
+
+    fn sign_tx(
+        &self,
+        ixs: &[Instruction],
+        bank: &Bank,
+        keypair: &Keypair,
+    ) -> RuntimeTransaction<SanitizedTransaction> {
+        let tx = VersionedTransaction::from(Transaction::new_signed_with_payer(
+            ixs,
+            Some(&keypair.pubkey()),
+            &[keypair],
+            bank.last_blockhash(),
+        ));
+        RuntimeTransaction::try_create(
+            tx,
+            MessageHash::Compute,
+            None,
+            bank,
+            bank.get_reserved_account_keys(),
+            true,
+        )
+        .unwrap()
+    }
+
+    /// Point the tip-payment program's global tip receiver at `new_tip_receiver`. The
+    /// program first drains the eight tip PDAs to `old_tip_receiver`, which is why they are
+    /// all passed writable.
+    pub fn change_tip_receiver_tx(
+        &self,
+        old_tip_receiver: &Pubkey,
+        new_tip_receiver: &Pubkey,
+        old_block_builder: &Pubkey,
+        bank: &Bank,
+        keypair: &Keypair,
+    ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
+        let ix = Instruction {
+            program_id: self.tip_payment_program_info.program_id,
+            data: ChangeTipReceiverInstruction::to_instruction_data(),
+            accounts: self.tip_ix_accounts(
+                &[*old_tip_receiver, *new_tip_receiver, *old_block_builder],
+                keypair,
+            ),
+        };
+        Ok(self.sign_tx(&[ix], bank, keypair))
+    }
+
+    /// Set the block builder and its commission. Must run after [`Self::change_tip_receiver_tx`]
+    /// in the same slot: the program constrains the passed tip receiver against the config.
+    pub fn change_block_builder_tx(
+        &self,
+        tip_receiver: &Pubkey,
+        old_block_builder: &Pubkey,
+        new_block_builder: &Pubkey,
+        block_builder_commission: u64,
+        bank: &Bank,
+        keypair: &Keypair,
+    ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
+        let ix = Instruction {
+            program_id: self.tip_payment_program_info.program_id,
+            data: ChangeBlockBuilderInstruction::to_instruction_data(block_builder_commission)?,
+            accounts: self.tip_ix_accounts(
+                &[*tip_receiver, *old_block_builder, *new_block_builder],
+                keypair,
+            ),
+        };
+        Ok(self.sign_tx(&[ix], bank, keypair))
+    }
+
+    /// Account list shared by the tip-payment mutating instructions:
+    /// `config, <caller-supplied>, tip_pda_0..7, signer`.
+    fn tip_ix_accounts(&self, middle: &[Pubkey], keypair: &Keypair) -> Vec<AccountMeta> {
+        let info = &self.tip_payment_program_info;
+        let mut accounts = Vec::with_capacity(2 + middle.len() + 8);
+        accounts.push(AccountMeta::new(info.config_pda_bump.0, false));
+        accounts.extend(middle.iter().map(|k| AccountMeta::new(*k, false)));
+        for pda in [
+            info.tip_pda_0.0,
+            info.tip_pda_1.0,
+            info.tip_pda_2.0,
+            info.tip_pda_3.0,
+            info.tip_pda_4.0,
+            info.tip_pda_5.0,
+            info.tip_pda_6.0,
+            info.tip_pda_7.0,
+        ] {
+            accounts.push(AccountMeta::new(pda, false));
+        }
+        accounts.push(AccountMeta::new(keypair.pubkey(), true));
+        accounts
+    }
+}
+
+/// One independently-executed stage of the tip-program crank. See
+/// [`TipManager::get_crank_steps`].
+pub struct CrankStep {
+    pub label: &'static str,
+    pub txs: SmallVec<[RuntimeTransaction<SanitizedTransaction>; 2]>,
+    /// Whether a failure here invalidates the remaining steps of the same program.
+    pub blocking: bool,
+}
+
+/// The tip programs this validator cranks each leader slot.
+///
+/// More than one is meaningful when the validator accepts order flow from more than one
+/// block engine: bundles from an upstream engine tip *that* engine's tip PDAs, which are
+/// derived from a different tip-payment program. Unless we crank that program too, those
+/// tips are swept to whichever validator cranks it next — we would be supplying the block
+/// space and someone else would collect. Each program is cranked independently so one
+/// misconfigured program can never disable another.
+#[derive(Debug, Clone)]
+pub struct TipManagers {
+    managers: Vec<TipManager>,
+    /// Union of every managed program's tip PDAs.
+    tip_accounts: HashSet<Pubkey>,
+}
+
+impl TipManagers {
+    pub fn new(configs: Vec<TipManagerConfig>) -> Self {
+        let managers: Vec<TipManager> = configs.into_iter().map(TipManager::new).collect();
+        let tip_accounts = managers
+            .iter()
+            .flat_map(|m| m.get_tip_accounts().iter().copied())
+            .collect();
+        Self { managers, tip_accounts }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &TipManager> {
+        self.managers.iter()
+    }
+
+    /// Every managed program's tip PDAs. Callers use this to decide whether a transaction
+    /// touches tip state at all, so it must cover all programs, not just the primary.
+    pub fn get_tip_accounts(&self) -> &HashSet<Pubkey> {
+        &self.tip_accounts
+    }
+
+    /// The program whose accounts this validator owns end-to-end; used where a single
+    /// program id is required (e.g. the fetch-stage account filter).
+    pub fn primary(&self) -> &TipManager {
+        &self.managers[0]
     }
 }

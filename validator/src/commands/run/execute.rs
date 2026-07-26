@@ -767,7 +767,7 @@ pub fn execute(
 
     let voting_disabled = matches.is_present("no_voting") || restricted_repair_only_mode;
 
-    let tip_manager_config = tip_manager_config_from_matches(matches, voting_disabled);
+    let tip_manager_configs = tip_manager_configs_from_matches(matches, voting_disabled);
 
     let bundle_cu_reserve_pct: u64 = value_of(matches, "bundle_cu_reserve_pct").unwrap_or(15);
     let bundle_reserve_release_pct: u64 =
@@ -962,7 +962,7 @@ pub fn execute(
         shred_receiver_addresses,
         shred_retransmit_receiver_addresses,
         multicast_receiver_address: Arc::new(ArcSwap::from_pointee(None)),
-        tip_manager_config,
+        tip_manager_configs,
         bam_url,
         disable_multicast_shred_check: matches.is_present("disable_multicast_shred_check"),
     };
@@ -1614,6 +1614,49 @@ mod xdp_tests {
             "XDP core overlapping PoH core must produce an error"
         );
     }
+}
+
+/// The tip programs this validator cranks, primary first.
+///
+/// A second set is configured when the validator also accepts bundles relayed from an
+/// upstream block engine: those bundles tip *that* engine's tip PDAs, derived from its own
+/// tip-payment program. Without cranking it, those tips are swept to whichever validator
+/// cranks it next — we would supply the block space and someone else would collect.
+fn tip_manager_configs_from_matches(
+    matches: &ArgMatches,
+    voting_disabled: bool,
+) -> Vec<TipManagerConfig> {
+    let mut configs = vec![tip_manager_config_from_matches(matches, voting_disabled)];
+
+    let upstream_payment = pubkey_of(matches, "upstream_tip_payment_program_pubkey");
+    let upstream_distribution = pubkey_of(matches, "upstream_tip_distribution_program_pubkey");
+    match (upstream_payment, upstream_distribution) {
+        (Some(tip_payment_program_id), Some(tip_distribution_program_id)) => {
+            // Same vote account, commission and merkle authority as the primary set: it is
+            // the same validator earning through a second program, so the same payout terms
+            // apply. Only the programs differ.
+            let primary = configs[0].tip_distribution_account_config.clone();
+            info!(
+                "upstream tip programs enabled: payment={tip_payment_program_id} \
+                 distribution={tip_distribution_program_id}"
+            );
+            configs.push(TipManagerConfig {
+                tip_payment_program_id,
+                tip_distribution_program_id,
+                tip_distribution_account_config: primary,
+            });
+        }
+        (None, None) => {}
+        _ => {
+            warn!(
+                "--upstream-tip-payment-program-pubkey and \
+                 --upstream-tip-distribution-program-pubkey must be given together; \
+                 upstream tip programs disabled"
+            );
+        }
+    }
+
+    configs
 }
 
 fn tip_manager_config_from_matches(
