@@ -42,7 +42,7 @@ use {
             atomic::{AtomicBool, AtomicU8, Ordering},
         },
         thread::{self, Builder, JoinHandle},
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
     thiserror::Error,
     tokio::{
@@ -789,7 +789,7 @@ impl BlockEngineStage {
 
         // Validator is the PBP policy authority: push our policy to the engine on connect.
         Self::push_pbp_policy(&mut client, connection_timeout).await;
-        Self::push_upstream_token(&mut client, connection_timeout, &keypair).await;
+        // The upstream token is pushed by the stream loop below, which owns its schedule.
 
         Self::consume_bundle_and_packet_stream(
             client,
@@ -852,6 +852,12 @@ impl BlockEngineStage {
         let pbp_path = Self::pbp_config_path();
         let mut pbp_mtime = pbp_path.as_deref().and_then(Self::pbp_mtime);
 
+        // When the next upstream token is due. The push mints a token upstream — a fresh
+        // connection and a full challenge/sign/exchange — so it must be driven by the
+        // token's own lifetime, not by this tick. It shares the metrics tick only because
+        // that is the loop's clock.
+        let mut upstream_push_due = Instant::now();
+
         while !exit.load(Ordering::Relaxed) {
             if BamConnectionState::from_u8(bam_enabled.load(Ordering::Relaxed))
                 == BamConnectionState::Connected
@@ -888,9 +894,17 @@ impl BlockEngineStage {
                         }
                     }
 
-                    // The upstream token is short-lived; re-mint it on the same cadence the
-                    // block-engine auth tokens are refreshed on. Cheap when unconfigured.
-                    Self::push_upstream_token(&mut client, connection_timeout, &keypair).await;
+                    // Re-mint the upstream token only once it is close to expiring. Doing
+                    // this every tick would re-authenticate upstream once a second, which
+                    // no upstream should be expected to tolerate.
+                    if Instant::now() >= upstream_push_due {
+                        upstream_push_due = Self::push_upstream_token(
+                            &mut client,
+                            connection_timeout,
+                            &keypair,
+                        )
+                        .await;
+                    }
 
                     if cluster_info.id() != keypair.pubkey() {
                         return Err(ProxyError::AuthenticationConnectionError("validator identity changed".to_string()));
@@ -1016,18 +1030,35 @@ impl BlockEngineStage {
     /// mint it here and send only the token: the key never leaves the validator, while the
     /// block engine still holds the upstream stream and merges its flow with its own.
     ///
-    /// The token is short-lived. This runs on every (re)connect to the block engine, which
-    /// is also what refreshes it.
+    /// Returns when this should next run. Each call opens a connection to the upstream and
+    /// runs a full challenge/sign/exchange, so callers must respect that deadline rather
+    /// than calling on a fixed tick.
+    ///
+    /// Prefer relaying the handshake through the block engine (which needs nothing set here)
+    /// — a token minted on this host may be refused when the engine subscribes with it.
     async fn push_upstream_token(
         client: &mut BlockEngineValidatorClient<InterceptedService<Channel, AuthInterceptor>>,
         connection_timeout: &Duration,
         keypair: &Arc<Keypair>,
-    ) {
+    ) -> Instant {
+        /// Back off this long after a failure, so an upstream that is refusing us is not
+        /// hammered.
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        /// Re-mint this long before expiry.
+        const REFRESH_MARGIN: Duration = Duration::from_secs(120);
+        /// Never re-mint more often than this, however short-lived the token claims to be.
+        const MIN_INTERVAL: Duration = Duration::from_secs(60);
+        /// Used when the upstream does not say when the token expires.
+        const UNKNOWN_EXPIRY_INTERVAL: Duration = Duration::from_secs(600);
+
+        let retry = || Instant::now() + RETRY_AFTER;
+
         let Ok(upstream_url) = std::env::var("FLOWRA_UPSTREAM_BLOCK_ENGINE_URL") else {
-            return;
+            // Nothing configured: check again rarely, in case it appears at runtime.
+            return Instant::now() + UNKNOWN_EXPIRY_INTERVAL;
         };
         if upstream_url.is_empty() {
-            return;
+            return Instant::now() + UNKNOWN_EXPIRY_INTERVAL;
         }
 
         let endpoint = match Endpoint::from_shared(upstream_url.clone()) {
@@ -1042,7 +1073,7 @@ impl BlockEngineStage {
                         Ok(ep) => ep,
                         Err(e) => {
                             warn!("upstream {upstream_url}: tls config failed: {e}");
-                            return;
+                            return retry();
                         }
                     }
                 } else {
@@ -1051,7 +1082,7 @@ impl BlockEngineStage {
             }
             Err(e) => {
                 warn!("FLOWRA_UPSTREAM_BLOCK_ENGINE_URL is not a valid endpoint: {e}");
-                return;
+                return retry();
             }
         };
 
@@ -1060,24 +1091,47 @@ impl BlockEngineStage {
                 Ok(t) => t,
                 Err(e) => {
                     warn!("upstream {upstream_url}: authentication failed: {e:?}");
-                    return;
+                    return retry();
                 }
             };
 
         let token = access_token.load();
+        let expires_at = token.expires_at_utc;
         let request = block_engine::UpstreamToken {
             upstream_url: upstream_url.clone(),
             access_token: token.value.clone(),
-            expires_at_utc: token.expires_at_utc,
+            expires_at_utc: expires_at,
         };
         match timeout(*connection_timeout, client.provide_upstream_token(request)).await {
             Ok(Ok(resp)) => info!(
                 "handed block engine an upstream token for {upstream_url} (refresh margin {}s)",
                 resp.into_inner().refresh_margin_secs
             ),
-            Ok(Err(status)) => warn!("provide_upstream_token failed: {status}"),
-            Err(_) => warn!("provide_upstream_token timed out"),
+            Ok(Err(status)) => {
+                warn!("provide_upstream_token failed: {status}");
+                return retry();
+            }
+            Err(_) => {
+                warn!("provide_upstream_token timed out");
+                return retry();
+            }
         }
+
+        // Next mint is driven by this token's own lifetime.
+        let lifetime = expires_at
+            .and_then(|ts| {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()?
+                    .as_secs() as i64;
+                u64::try_from(ts.seconds.saturating_sub(now)).ok()
+            })
+            .map(Duration::from_secs);
+        let until_due = match lifetime {
+            Some(l) => l.saturating_sub(REFRESH_MARGIN).max(MIN_INTERVAL),
+            None => UNKNOWN_EXPIRY_INTERVAL,
+        };
+        Instant::now() + until_due
     }
 
     /// Push the validator's current PBP policy to the block engine (best-effort).
