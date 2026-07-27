@@ -789,6 +789,7 @@ impl BlockEngineStage {
 
         // Validator is the PBP policy authority: push our policy to the engine on connect.
         Self::push_pbp_policy(&mut client, connection_timeout).await;
+        Self::push_upstream_token(&mut client, connection_timeout, &keypair).await;
 
         Self::consume_bundle_and_packet_stream(
             client,
@@ -886,6 +887,10 @@ impl BlockEngineStage {
                             Self::push_pbp_policy(&mut client, connection_timeout).await;
                         }
                     }
+
+                    // The upstream token is short-lived; re-mint it on the same cadence the
+                    // block-engine auth tokens are refreshed on. Cheap when unconfigured.
+                    Self::push_upstream_token(&mut client, connection_timeout, &keypair).await;
 
                     if cluster_info.id() != keypair.pubkey() {
                         return Err(ProxyError::AuthenticationConnectionError("validator identity changed".to_string()));
@@ -1001,6 +1006,74 @@ impl BlockEngineStage {
             force_priority_searchers: arr("force_priority", "searchers"),
             category_quotas,
         })
+    }
+
+    /// Authenticate to an UPSTREAM block engine and hand our block engine the resulting
+    /// access token (best-effort; enabled by `FLOWRA_UPSTREAM_BLOCK_ENGINE_URL`).
+    ///
+    /// The upstream scopes order flow to the leader slots of whichever identity
+    /// authenticated, so the token has to be minted by *this validator's* identity key. We
+    /// mint it here and send only the token: the key never leaves the validator, while the
+    /// block engine still holds the upstream stream and merges its flow with its own.
+    ///
+    /// The token is short-lived. This runs on every (re)connect to the block engine, which
+    /// is also what refreshes it.
+    async fn push_upstream_token(
+        client: &mut BlockEngineValidatorClient<InterceptedService<Channel, AuthInterceptor>>,
+        connection_timeout: &Duration,
+        keypair: &Arc<Keypair>,
+    ) {
+        let Ok(upstream_url) = std::env::var("FLOWRA_UPSTREAM_BLOCK_ENGINE_URL") else {
+            return;
+        };
+        if upstream_url.is_empty() {
+            return;
+        }
+
+        let endpoint = match Endpoint::from_shared(upstream_url.clone()) {
+            Ok(ep) => {
+                let ep = ep.tcp_keepalive(Some(Duration::from_secs(60)));
+                if upstream_url.starts_with("https://") {
+                    match ep.tls_config(tonic::transport::ClientTlsConfig::new()) {
+                        Ok(ep) => ep,
+                        Err(e) => {
+                            warn!("upstream {upstream_url}: tls config failed: {e}");
+                            return;
+                        }
+                    }
+                } else {
+                    ep
+                }
+            }
+            Err(e) => {
+                warn!("FLOWRA_UPSTREAM_BLOCK_ENGINE_URL is not a valid endpoint: {e}");
+                return;
+            }
+        };
+
+        let (_auth_client, access_token, _refresh) =
+            match auth_client_from_endpoint(&endpoint, connection_timeout, keypair).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("upstream {upstream_url}: authentication failed: {e:?}");
+                    return;
+                }
+            };
+
+        let token = access_token.load();
+        let request = block_engine::UpstreamToken {
+            upstream_url: upstream_url.clone(),
+            access_token: token.value.clone(),
+            expires_at_utc: token.expires_at_utc,
+        };
+        match timeout(*connection_timeout, client.provide_upstream_token(request)).await {
+            Ok(Ok(resp)) => info!(
+                "handed block engine an upstream token for {upstream_url} (refresh margin {}s)",
+                resp.into_inner().refresh_margin_secs
+            ),
+            Ok(Err(status)) => warn!("provide_upstream_token failed: {status}"),
+            Err(_) => warn!("provide_upstream_token timed out"),
+        }
     }
 
     /// Push the validator's current PBP policy to the block engine (best-effort).
