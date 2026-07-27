@@ -1034,7 +1034,11 @@ impl BlockEngineStage {
             Ok(ep) => {
                 let ep = ep.tcp_keepalive(Some(Duration::from_secs(60)));
                 if upstream_url.starts_with("https://") {
-                    match ep.tls_config(tonic::transport::ClientTlsConfig::new()) {
+                    // with_enabled_roots() is load-bearing: ClientTlsConfig::new() carries no
+                    // trust anchors at all, so the handshake fails as a bare "transport error".
+                    match ep.tls_config(
+                        tonic::transport::ClientTlsConfig::new().with_enabled_roots(),
+                    ) {
                         Ok(ep) => ep,
                         Err(e) => {
                             warn!("upstream {upstream_url}: tls config failed: {e}");
