@@ -806,13 +806,18 @@ pub fn execute(
 
     let tip_manager_configs = tip_manager_configs_from_matches(matches, voting_disabled);
 
-    let bundle_cu_reserve_pct: u64 = value_of(matches, "bundle_cu_reserve_pct").unwrap_or(15);
-    let bundle_reserve_release_pct: u64 =
-        value_of(matches, "bundle_reserve_release_pct").unwrap_or(70);
-    info!(
-        "Flowra bundle CU settings: reserve_pct={bundle_cu_reserve_pct}%, \
-         release_pct={bundle_reserve_release_pct}%"
-    );
+    // These never did anything: the values were parsed, logged, and read by nothing. Say so
+    // rather than printing a reassuring line about a reservation that does not exist.
+    for arg in ["bundle_cu_reserve_pct", "bundle_reserve_release_pct"] {
+        if matches.occurrences_of(arg) > 0 {
+            warn!(
+                "--{} is deprecated and ignored — no block CU is reserved for bundles. \
+                 Bundles get their ordering from the block engine and their account locks \
+                 from BundleStage; remove the flag.",
+                arg.replace('_', "-")
+            );
+        }
+    }
 
     let block_engine_config = Arc::new(ArcSwap::from_pointee(BlockEngineConfig {
         block_engine_url: value_of(matches, "block_engine_url").unwrap_or_default(),

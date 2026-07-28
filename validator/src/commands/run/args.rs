@@ -1333,26 +1333,24 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        // DEPRECATED, no effect. Never implemented: the value was parsed, logged, and read
+        // by nothing. Still accepted so launch scripts that pass it keep starting; the
+        // validator warns instead. Remove once those have been updated.
         Arg::with_name("bundle_cu_reserve_pct")
             .long("bundle-cu-reserve-pct")
             .value_name("BUNDLE_CU_RESERVE_PCT")
             .takes_value(true)
-            .default_value("15")
-            .help(
-                "Percentage of block CU budget to reserve for bundles (0-100). \
-                 Default is 15%.",
-            ),
+            .hidden(true)
+            .help("DEPRECATED and ignored. No block CU is reserved for bundles."),
     )
     .arg(
+        // DEPRECATED, no effect — see --bundle-cu-reserve-pct.
         Arg::with_name("bundle_reserve_release_pct")
             .long("bundle-reserve-release-pct")
             .value_name("BUNDLE_RESERVE_RELEASE_PCT")
             .takes_value(true)
-            .default_value("70")
-            .help(
-                "Percentage of bundle CU reservation to release back to general \
-                 transactions when no bundles are pending. Default is 70%.",
-            ),
+            .hidden(true)
+            .help("DEPRECATED and ignored. No block CU is reserved for bundles."),
     )
     .arg(
         Arg::with_name("shred_receiver_address")
