@@ -26,12 +26,14 @@ use {
     agave_scheduling_utils::thread_aware_account_locks::{
         ThreadAwareAccountLocks, ThreadId, ThreadSet, TryLockError,
     },
+    ahash::{HashMap, HashMapExt},
     crossbeam_channel::{Receiver, Sender},
     log::info,
     solana_clock::Slot,
     solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS,
+    solana_pubkey::Pubkey,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
-    std::num::Saturating,
+    std::{env, num::Saturating},
 };
 
 // FLOWRA PoC: same knobs as `GreedySchedulerConfig` for now; conflict-aware
@@ -68,6 +70,11 @@ struct ConflictAwarePassStats {
     unschedulable_conflict: usize,
     /// Number of transactions unschedulable due to thread capacity.
     unschedulable_thread: usize,
+    /// FLOWRA PoC: CUs scheduled onto each worker thread this slot. Grown to
+    /// `num_threads` on first pass. The spread across this vec is the greedy
+    /// scheduler's makespan imbalance — the quantity a graph/bin-packing
+    /// scheduler would improve, and the gate for whether it's worth building.
+    scheduled_cus_per_thread: Vec<u64>,
 }
 
 impl ConflictAwarePassStats {
@@ -77,12 +84,24 @@ impl ConflictAwarePassStats {
         scheduled: usize,
         unschedulable_conflict: usize,
         unschedulable_thread: usize,
+        pass_cus_per_thread: &[u64],
     ) {
         self.passes += 1;
         self.popped += popped;
         self.scheduled += scheduled;
         self.unschedulable_conflict += unschedulable_conflict;
         self.unschedulable_thread += unschedulable_thread;
+        if self.scheduled_cus_per_thread.len() < pass_cus_per_thread.len() {
+            self.scheduled_cus_per_thread
+                .resize(pass_cus_per_thread.len(), 0);
+        }
+        for (acc, add) in self
+            .scheduled_cus_per_thread
+            .iter_mut()
+            .zip(pass_cus_per_thread)
+        {
+            *acc += *add;
+        }
     }
 
     /// Report and reset tallies when the observed leader slot changes.
@@ -92,9 +111,26 @@ impl ConflictAwarePassStats {
             return;
         }
         if let Some(prev_slot) = self.current_slot {
+            // FLOWRA PoC: per-thread CU balance + makespan imbalance for this slot.
+            // imbalance = max_thread_cu / mean_thread_cu (1.0 == perfectly balanced).
+            // A greedy scheduler that already lands near 1.0 under contention load
+            // leaves no makespan headroom for a graph scheduler — this is the gate.
+            let cus = &self.scheduled_cus_per_thread;
+            let nthreads = cus.len().max(1);
+            let total_cu: u64 = cus.iter().sum();
+            let max_cu = cus.iter().copied().max().unwrap_or(0);
+            let min_cu = cus.iter().copied().min().unwrap_or(0);
+            let mean_cu = total_cu as f64 / nthreads as f64;
+            let imbalance = if mean_cu > 0.0 {
+                max_cu as f64 / mean_cu
+            } else {
+                0.0
+            };
             info!(
                 "conflict_aware_scheduler_stats: slot={prev_slot} passes={} popped={} \
-                 scheduled={} unschedulable_conflict={} unschedulable_thread={}",
+                 scheduled={} unschedulable_conflict={} unschedulable_thread={} \
+                 total_cu={total_cu} max_cu={max_cu} min_cu={min_cu} \
+                 imbalance={imbalance:.3} per_thread_cu={cus:?}",
                 self.passes,
                 self.popped,
                 self.scheduled,
@@ -109,6 +145,109 @@ impl ConflictAwarePassStats {
     }
 }
 
+/// FLOWRA Stage 1 probe: per-leader-slot account co-occurrence structure via
+/// union-find. Every scheduled tx unions all of its writable accounts; at the
+/// slot boundary the connected components + their aggregate CU are logged.
+///
+/// This answers, cheaply and *without* changing scheduling, whether the load is
+/// graph-improvable: many independent components each holding a modest CU share
+/// => a cluster->thread bin-packer (Stage 1 / Rakurai's graph) can rebalance
+/// makespan; one giant component holding ~all CU => nothing can split it and
+/// Stage 1 is futile on this load. Env-gated by `FLOWRA_COOC_PROBE`.
+#[derive(Default)]
+struct CoocProbe {
+    current_slot: Option<Slot>,
+    idx: HashMap<Pubkey, u32>,
+    parent: Vec<u32>,
+    node_cu: Vec<u64>,
+    num_txs: usize,
+}
+
+impl CoocProbe {
+    fn node(&mut self, key: &Pubkey) -> u32 {
+        if let Some(&id) = self.idx.get(key) {
+            return id;
+        }
+        let id = self.parent.len() as u32;
+        self.idx.insert(*key, id);
+        self.parent.push(id);
+        self.node_cu.push(0);
+        id
+    }
+
+    fn find(&mut self, mut x: u32) -> u32 {
+        while self.parent[x as usize] != x {
+            // path halving
+            let grandparent = self.parent[self.parent[x as usize] as usize];
+            self.parent[x as usize] = grandparent;
+            x = grandparent;
+        }
+        x
+    }
+
+    fn union(&mut self, a: u32, b: u32) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            self.parent[ra as usize] = rb;
+        }
+    }
+
+    /// Union all writable accounts of one scheduled tx; credit its CU to the
+    /// component (attributed to the first write account's node).
+    fn record_tx(&mut self, write_keys: &[Pubkey], cost: u64) {
+        let Some((first, rest)) = write_keys.split_first() else {
+            return;
+        };
+        self.num_txs += 1;
+        let n0 = self.node(first);
+        self.node_cu[n0 as usize] += cost;
+        for key in rest {
+            let nk = self.node(key);
+            self.union(n0, nk);
+        }
+    }
+
+    fn observe_slot(&mut self, slot: Option<Slot>) {
+        if slot == self.current_slot {
+            return;
+        }
+        if let (Some(prev_slot), false) = (self.current_slot, self.parent.is_empty()) {
+            let n = self.parent.len();
+            let mut comp_cu: HashMap<u32, u64> = HashMap::new();
+            let mut comp_acc: HashMap<u32, u32> = HashMap::new();
+            for i in 0..n as u32 {
+                let root = self.find(i);
+                *comp_cu.entry(root).or_insert(0) += self.node_cu[i as usize];
+                *comp_acc.entry(root).or_insert(0) += 1;
+            }
+            let total_cu: u64 = comp_cu.values().sum();
+            let mut comps: Vec<(u64, u32)> =
+                comp_cu.iter().map(|(r, &cu)| (cu, comp_acc[r])).collect();
+            comps.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let (largest_cu, largest_accts) = comps.first().copied().unwrap_or((0, 0));
+            let largest_pct = if total_cu > 0 {
+                100.0 * largest_cu as f64 / total_cu as f64
+            } else {
+                0.0
+            };
+            let top5_cu: Vec<u64> = comps.iter().take(5).map(|c| c.0).collect();
+            info!(
+                "cooc_probe: slot={prev_slot} txs={} accounts={n} components={} \
+                 total_cu={total_cu} largest_cu={largest_cu} ({largest_pct:.1}% of total) \
+                 largest_accts={largest_accts} top5_cu={top5_cu:?}",
+                self.num_txs,
+                comps.len(),
+            );
+        }
+        self.current_slot = slot;
+        self.idx.clear();
+        self.parent.clear();
+        self.node_cu.clear();
+        self.num_txs = 0;
+    }
+}
+
 /// FLOWRA PoC: conflict-aware scheduler. Currently a structural copy of
 /// `GreedyScheduler`: schedules in priority order, scheduling anything that
 /// can be immediately scheduled, up to the limits.
@@ -119,6 +258,35 @@ pub struct ConflictAwareScheduler<Tx: TransactionWithMeta> {
     bundle_account_locker: BundleAccountLocker,
     // FLOWRA PoC: per-pass tallies, reported per leader-slot change.
     pass_stats: ConflictAwarePassStats,
+
+    // FLOWRA Stage 0: hot-account CU-balanced thread affinity (env-gated;
+    // `stage0_enabled == false` keeps behaviour byte-identical to greedy).
+    //
+    // The greedy scheduler pins each account to the least-loaded thread at
+    // first-touch with zero look-ahead to a cluster's eventual total CU, so two
+    // hot clusters can land on the same thread and inflate makespan. Stage 0
+    // learns each hot account's aggregate CU from the *previous* leader slot,
+    // LPT-assigns whole accounts to threads (largest CU first -> least-loaded
+    // thread), and biases `thread_selector` toward that preferred thread before
+    // first-touch pins it. Prediction is only a *hint*: it is honoured solely
+    // when the preferred thread is already lock-legal (in `thread_set`),
+    // otherwise it falls back to the greedy least-loaded pick — so correctness
+    // is independent of prediction quality.
+    stage0_enabled: bool,
+    /// Cap on how many hot accounts carry an affinity (largest CU first).
+    stage0_top_k: usize,
+    /// Hot account -> (preferred thread, projected CU) learned from the prior
+    /// leader slot, consulted this slot.
+    affinity_map: HashMap<Pubkey, (ThreadId, u64)>,
+    /// Per-write-account CU accumulated during the current leader slot; drained
+    /// into `affinity_map` at the next leader-slot boundary.
+    slot_account_cus: HashMap<Pubkey, u64>,
+    /// Leader slot the current `affinity_map` was built for (Some slots only).
+    current_affinity_slot: Option<Slot>,
+
+    // FLOWRA Stage 1 probe: env-gated account co-occurrence structure logging.
+    cooc_probe_enabled: bool,
+    cooc: CoocProbe,
 }
 
 impl<Tx: TransactionWithMeta> ConflictAwareScheduler<Tx> {
@@ -128,6 +296,26 @@ impl<Tx: TransactionWithMeta> ConflictAwareScheduler<Tx> {
         config: ConflictAwareSchedulerConfig,
         bundle_account_locker: BundleAccountLocker,
     ) -> Self {
+        let stage0_enabled = env::var("FLOWRA_STAGE0")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+        let stage0_top_k = env::var("FLOWRA_STAGE0_TOP_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|k| *k > 0)
+            .unwrap_or(64);
+        if stage0_enabled {
+            info!(
+                "conflict_aware_stage0: ENABLED top_k={stage0_top_k} \
+                 (hot-account CU-balanced thread affinity)"
+            );
+        }
+        let cooc_probe_enabled = env::var("FLOWRA_COOC_PROBE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+        if cooc_probe_enabled {
+            info!("cooc_probe: ENABLED (per-slot account co-occurrence component structure)");
+        }
         Self {
             unschedulables: Vec::with_capacity(config.max_scanned_transactions_per_scheduling_pass),
             common: SchedulingCommon::new(
@@ -138,7 +326,65 @@ impl<Tx: TransactionWithMeta> ConflictAwareScheduler<Tx> {
             config,
             bundle_account_locker,
             pass_stats: ConflictAwarePassStats::default(),
+            stage0_enabled,
+            stage0_top_k,
+            affinity_map: HashMap::new(),
+            slot_account_cus: HashMap::new(),
+            current_affinity_slot: None,
+            cooc_probe_enabled,
+            cooc: CoocProbe::default(),
         }
+    }
+
+    /// FLOWRA Stage 0: rebuild `affinity_map` from the just-finished leader
+    /// slot's per-account CU via LPT (longest-processing-time-first): sort hot
+    /// accounts by CU desc, keep the top-K, and greedily place each on the
+    /// currently least-loaded thread. Drains `slot_account_cus` so the next
+    /// slot accumulates fresh.
+    fn rebuild_affinity(&mut self, num_threads: usize) {
+        let mut accounts: Vec<(Pubkey, u64)> = self.slot_account_cus.drain().collect();
+        if accounts.is_empty() {
+            self.affinity_map.clear();
+            return;
+        }
+        accounts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        accounts.truncate(self.stage0_top_k);
+
+        let mut thread_load = vec![0u64; num_threads.max(1)];
+        let mut new_map: HashMap<Pubkey, (ThreadId, u64)> = HashMap::with_capacity(accounts.len());
+        for (acct, cu) in accounts {
+            // LPT: assign this (next-largest) account to the least-loaded thread.
+            let thread_id = (0..thread_load.len())
+                .min_by_key(|&t| thread_load[t])
+                .unwrap_or(0);
+            thread_load[thread_id] += cu;
+            new_map.insert(acct, (thread_id, cu));
+        }
+        info!(
+            "conflict_aware_stage0: rebuilt affinity hot_accounts={} projected_thread_load={:?}",
+            new_map.len(),
+            thread_load,
+        );
+        self.affinity_map = new_map;
+    }
+
+    /// FLOWRA Stage 0: at each new leader-slot boundary, promote the previous
+    /// slot's accumulated per-account CU into `affinity_map`. Only fires on
+    /// `Some(slot)` transitions (non-leader `None` gaps are ignored so the prior
+    /// slot's accumulation survives until the next leader slot consumes it).
+    fn maybe_rebuild_affinity(&mut self, slot: Option<Slot>) {
+        if !self.stage0_enabled {
+            return;
+        }
+        let Some(slot) = slot else {
+            return;
+        };
+        if Some(slot) == self.current_affinity_slot {
+            return;
+        }
+        let num_threads = self.common.consume_work_senders.len();
+        self.rebuild_affinity(num_threads);
+        self.current_affinity_slot = Some(slot);
     }
 }
 
@@ -191,6 +437,8 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
         let mut num_sent: usize = 0;
         let mut num_unschedulable_conflicts: usize = 0;
         let mut num_unschedulable_threads: usize = 0;
+        // FLOWRA PoC: CUs this pass placed the greedy way, per worker thread.
+        let mut pass_cus_per_thread = vec![0u64; num_threads];
 
         while budget > 0
             && num_scanned < self.config.max_scanned_transactions_per_scheduling_pass
@@ -209,15 +457,49 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
                 panic!("transaction state must exist")
             };
 
-            // FLOWRA PoC: this is where conflict-aware ordering will diverge
-            // from the greedy scheduler — instead of retrying strictly in
-            // priority order, conflicting transactions will be steered/deferred
-            // based on observed account contention.
+            // FLOWRA Stage 0: peek the transaction's writable accounts to (a)
+            // find its preferred thread (the affinity of its hottest known
+            // account) and (b) capture the write keys for this-slot CU
+            // accumulation. Cheap no-op when Stage 0 is disabled.
+            let mut write_keys_buf: Vec<Pubkey> = Vec::new();
+            let preferred_thread: Option<ThreadId> = if self.stage0_enabled
+                || self.cooc_probe_enabled
+            {
+                let transaction = transaction_state.transaction();
+                let account_keys = transaction.account_keys();
+                let mut best: Option<(ThreadId, u64)> = None;
+                for (index, key) in account_keys.iter().enumerate() {
+                    if transaction.is_writable(index) {
+                        write_keys_buf.push(*key);
+                        if self.stage0_enabled {
+                            if let Some(&(thread_id, cu)) = self.affinity_map.get(key) {
+                                if best.is_none_or(|(_, best_cu)| cu > best_cu) {
+                                    best = Some((thread_id, cu));
+                                }
+                            }
+                        }
+                    }
+                }
+                best.map(|(thread_id, _)| thread_id)
+            } else {
+                None
+            };
+
+            // FLOWRA PoC: this is where conflict-aware ordering diverges from the
+            // greedy scheduler. Stage 0 steers the thread choice toward a hot
+            // account's CU-balanced preferred thread, but only when that thread
+            // is already lock-legal for this transaction; otherwise it falls
+            // back to the greedy least-loaded pick.
             match try_schedule_transaction(
                 transaction_state,
                 &mut self.common.account_locks,
                 schedulable_threads,
                 |thread_set| {
+                    if let Some(preferred) = preferred_thread {
+                        if thread_set.contains(preferred) {
+                            return preferred;
+                        }
+                    }
                     select_thread(
                         thread_set,
                         self.common.batches.total_cus(),
@@ -243,6 +525,18 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
                     cost,
                 }) => {
                     num_scheduled += 1;
+                    pass_cus_per_thread[thread_id] += cost;
+                    // FLOWRA Stage 1 probe: union this tx's writable accounts.
+                    if self.cooc_probe_enabled {
+                        self.cooc.record_tx(&write_keys_buf, cost);
+                    }
+                    // FLOWRA Stage 0: attribute this tx's CU to each of its
+                    // writable accounts for next-slot affinity learning.
+                    if self.stage0_enabled {
+                        for key in write_keys_buf.drain(..) {
+                            *self.slot_account_cus.entry(key).or_insert(0) += cost;
+                        }
+                    }
                     self.common.batches.add_transaction_to_batch(
                         thread_id,
                         id.id,
@@ -291,6 +585,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
             num_scheduled,
             num_unschedulable_conflicts,
             num_unschedulable_threads,
+            &pass_cus_per_thread,
         );
 
         Ok(SchedulingSummary {
@@ -310,8 +605,15 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
         container: &mut impl StateContainer<Tx>,
         decision: &BufferedPacketsDecision,
     ) -> Result<(usize, usize), SchedulerError> {
-        self.pass_stats
-            .observe_slot(decision.bank().map(|bank| bank.slot()));
+        let observed_slot = decision.bank().map(|bank| bank.slot());
+        self.pass_stats.observe_slot(observed_slot);
+        // FLOWRA Stage 0: promote the previous slot's per-account CU into the
+        // affinity map at each new leader-slot boundary.
+        self.maybe_rebuild_affinity(observed_slot);
+        // FLOWRA Stage 1 probe: log the previous slot's co-occurrence structure.
+        if self.cooc_probe_enabled {
+            self.cooc.observe_slot(observed_slot);
+        }
 
         let mut total_num_transactions = Saturating::<usize>(0);
         let mut total_num_retryable = Saturating::<usize>(0);

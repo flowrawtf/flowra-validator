@@ -745,7 +745,7 @@ fn transfer_with_compute_unit_price_and_padding_legacy(
     // BENCH_TPS_BURNER_PROGRAM + BENCH_TPS_BURNER_ROUNDS: append a call to the
     // CU-burner program so the tx consumes real compute units (~ rounds*cost),
     // shrinking block capacity so modest TPS oversubscribes the block.
-    if let Some(burn) = maybe_burner_instruction() {
+    if let Some(burn) = maybe_burner_instruction(&from_pubkey) {
         instructions.push(burn);
     }
     let message = Message::new(&instructions, Some(&from_pubkey));
@@ -761,19 +761,81 @@ fn maybe_tip_instruction(from_pubkey: &Pubkey) -> Option<solana_instruction::Ins
     Some(system_instruction::transfer(from_pubkey, &tip_account, lamports))
 }
 
-fn maybe_burner_instruction() -> Option<solana_instruction::Instruction> {
+// A deterministic "hot pool" account for contention index `i` (shared across senders).
+fn burner_pool_pubkey(i: u16) -> Pubkey {
+    let mut b = [0u8; 32];
+    b[0] = 0xC0; // marker
+    b[1] = (i >> 8) as u8;
+    b[2] = i as u8;
+    Pubkey::new_from_array(b)
+}
+
+// A per-sender unique "user" account (writable), variant-tagged so each tx touches
+// its own cold accounts alongside the shared hot pool.
+fn burner_user_pubkey(from: &Pubkey, variant: u8) -> Pubkey {
+    let mut b = from.to_bytes();
+    b[0] ^= variant;
+    b[31] ^= variant;
+    Pubkey::new_from_array(b)
+}
+
+fn maybe_burner_instruction(from_pubkey: &Pubkey) -> Option<solana_instruction::Instruction> {
     let program: Pubkey = std::env::var("BENCH_TPS_BURNER_PROGRAM")
         .ok()?
         .parse()
         .expect("BENCH_TPS_BURNER_PROGRAM must be a base58 pubkey");
-    let rounds: u32 = std::env::var("BENCH_TPS_BURNER_ROUNDS")
+    let base_rounds: u32 = std::env::var("BENCH_TPS_BURNER_ROUNDS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8000);
+
+    // BENCH_TPS_BURNER_POOLS=N enables realistic multi-account write-contention:
+    // each tx write-locks one power-law-selected shared "hot pool" (of N) plus two
+    // per-sender unique accounts. Per-pool round count is skewed (hot/low-index
+    // pools burn more CU) so cluster CU varies — the regime where cluster->thread
+    // bin-packing quality (makespan) separates a graph scheduler from greedy.
+    let (accounts, rounds) = match std::env::var("BENCH_TPS_BURNER_POOLS")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|n| *n > 0)
+    {
+        Some(n) => {
+            let fb = from_pubkey.to_bytes();
+            let u = ((fb[5] as u32) << 8 | fb[17] as u32) as f64 / 65535.0;
+            // BENCH_TPS_BURNER_UNIFORM=1 => uniform pool pick + uniform CU per tx.
+            // This synthesises the mainnet-like "many independent, equally-hot
+            // pools" regime where cluster->thread bin-packing (graph scheduler)
+            // separates cleanly from greedy. Default (unset) keeps the power-law
+            // skew (low-index pools dominate -> one giant component that caps any
+            // scheduler's makespan gain).
+            let uniform = std::env::var("BENCH_TPS_BURNER_UNIFORM")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let (pool, rounds) = if uniform {
+                ((u * n as f64) as u16 % n, base_rounds)
+            } else {
+                // power-law pool pick: square a uniform draw so low indices dominate.
+                let pool = ((u * u) * n as f64) as u16 % n;
+                // hot (low-index) pools burn more CU -> cluster-size variance.
+                // base_rounds is the CEILING; lighter pools burn to ~base_rounds/4.
+                let floor = base_rounds / 4;
+                let rounds = floor + (base_rounds - floor) * (n - pool) as u32 / n as u32;
+                (pool, rounds)
+            };
+            let accounts = vec![
+                solana_instruction::AccountMeta::new(burner_pool_pubkey(pool), false),
+                solana_instruction::AccountMeta::new(burner_user_pubkey(from_pubkey, 0x55), false),
+                solana_instruction::AccountMeta::new(burner_user_pubkey(from_pubkey, 0xAA), false),
+            ];
+            (accounts, rounds)
+        }
+        None => (vec![], base_rounds),
+    };
+
     Some(solana_instruction::Instruction::new_with_bytes(
         program,
         &rounds.to_le_bytes(),
-        vec![],
+        accounts,
     ))
 }
 
