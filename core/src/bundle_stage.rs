@@ -1039,7 +1039,7 @@ mod tests {
             replay_vote_sender,
             None,
             exit.clone(),
-            TipManager::new(TipManagerConfig {
+            TipManagers::new(vec![TipManagerConfig {
                 tip_payment_program_id: Pubkey::from(jito_tip_payment::id().to_bytes()),
                 tip_distribution_program_id: Pubkey::from(jito_tip_distribution::id().to_bytes()),
                 tip_distribution_account_config: TipDistributionAccountConfig {
@@ -1047,7 +1047,7 @@ mod tests {
                     vote_account: genesis_config_info.voting_keypair.pubkey(),
                     commission_bps: 10,
                 },
-            }),
+            }]),
             BundleAccountLocker::default(),
             &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                 block_builder: genesis_config_info.validator_pubkey,
@@ -1177,7 +1177,7 @@ mod tests {
             replay_vote_sender,
             None,
             exit.clone(),
-            TipManager::new(TipManagerConfig {
+            TipManagers::new(vec![TipManagerConfig {
                 tip_payment_program_id: Pubkey::from(jito_tip_payment::id().to_bytes()),
                 tip_distribution_program_id: Pubkey::from(jito_tip_distribution::id().to_bytes()),
                 tip_distribution_account_config: TipDistributionAccountConfig {
@@ -1185,7 +1185,7 @@ mod tests {
                     vote_account: genesis_config_info.voting_keypair.pubkey(),
                     commission_bps: 10,
                 },
-            }),
+            }]),
             BundleAccountLocker::default(),
             &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                 block_builder: genesis_config_info.validator_pubkey,
@@ -1267,7 +1267,7 @@ mod tests {
             replay_vote_sender,
             None,
             exit.clone(),
-            TipManager::new(TipManagerConfig {
+            TipManagers::new(vec![TipManagerConfig {
                 tip_payment_program_id: Pubkey::from(jito_tip_payment::id().to_bytes()),
                 tip_distribution_program_id: Pubkey::from(jito_tip_distribution::id().to_bytes()),
                 tip_distribution_account_config: TipDistributionAccountConfig {
@@ -1275,7 +1275,7 @@ mod tests {
                     vote_account: genesis_config_info.voting_keypair.pubkey(),
                     commission_bps: 10,
                 },
-            }),
+            }]),
             BundleAccountLocker::default(),
             &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                 block_builder: genesis_config_info.validator_pubkey,
@@ -1391,7 +1391,7 @@ mod tests {
             replay_vote_sender,
             None,
             exit.clone(),
-            TipManager::new(TipManagerConfig {
+            TipManagers::new(vec![TipManagerConfig {
                 tip_payment_program_id: Pubkey::from(jito_tip_payment::id().to_bytes()),
                 tip_distribution_program_id: Pubkey::from(jito_tip_distribution::id().to_bytes()),
                 tip_distribution_account_config: TipDistributionAccountConfig {
@@ -1399,7 +1399,7 @@ mod tests {
                     vote_account: genesis_config_info.voting_keypair.pubkey(),
                     commission_bps: 10,
                 },
-            }),
+            }]),
             BundleAccountLocker::default(),
             &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                 block_builder: genesis_config_info.validator_pubkey,
@@ -1515,7 +1515,7 @@ mod tests {
             replay_vote_sender,
             None,
             exit.clone(),
-            TipManager::new(TipManagerConfig {
+            TipManagers::new(vec![TipManagerConfig {
                 tip_payment_program_id: Pubkey::from(jito_tip_payment::id().to_bytes()),
                 tip_distribution_program_id: Pubkey::from(jito_tip_distribution::id().to_bytes()),
                 tip_distribution_account_config: TipDistributionAccountConfig {
@@ -1523,7 +1523,7 @@ mod tests {
                     vote_account: genesis_config_info.voting_keypair.pubkey(),
                     commission_bps: 10,
                 },
-            }),
+            }]),
             BundleAccountLocker::default(),
             &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                 block_builder: genesis_config_info.validator_pubkey,

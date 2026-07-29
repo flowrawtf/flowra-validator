@@ -6,6 +6,7 @@
 
 use {
     super::{
+        greedy_scheduler::BLOCK_LIMIT_IN_FLIGHT_DIVISOR,
         scheduler::{Scheduler, SchedulingSummary},
         scheduler_common::{
             SchedulingCommon, TransactionSchedulingError, TransactionSchedulingInfo, select_thread,
@@ -39,7 +40,8 @@ use {
 // FLOWRA PoC: same knobs as `GreedySchedulerConfig` for now; conflict-aware
 // specific knobs (e.g. conflict look-ahead depth) will be added here.
 pub(crate) struct ConflictAwareSchedulerConfig {
-    pub target_scheduled_cus: u64,
+    /// See [`super::greedy_scheduler::GreedySchedulerConfig::target_scheduled_cus`].
+    pub target_scheduled_cus: Option<u64>,
     pub max_scanned_transactions_per_scheduling_pass: usize,
     pub target_transactions_per_batch: usize,
 }
@@ -47,7 +49,7 @@ pub(crate) struct ConflictAwareSchedulerConfig {
 impl Default for ConflictAwareSchedulerConfig {
     fn default() -> Self {
         Self {
-            target_scheduled_cus: MAX_BLOCK_UNITS / 4,
+            target_scheduled_cus: None,
             max_scanned_transactions_per_scheduling_pass: 100_000,
             target_transactions_per_batch: TARGET_NUM_TRANSACTIONS_PER_BATCH,
         }
@@ -287,6 +289,10 @@ pub struct ConflictAwareScheduler<Tx: TransactionWithMeta> {
     // FLOWRA Stage 1 probe: env-gated account co-occurrence structure logging.
     cooc_probe_enabled: bool,
     cooc: CoocProbe,
+
+    /// Block cost limit of the current leader bank. Only consulted when
+    /// `config.target_scheduled_cus` is `None`.
+    block_limit: u64,
 }
 
 impl<Tx: TransactionWithMeta> ConflictAwareScheduler<Tx> {
@@ -333,7 +339,15 @@ impl<Tx: TransactionWithMeta> ConflictAwareScheduler<Tx> {
             current_affinity_slot: None,
             cooc_probe_enabled,
             cooc: CoocProbe::default(),
+            block_limit: MAX_BLOCK_UNITS,
         }
+    }
+
+    /// Total in-flight CU the scheduler may hold across all worker threads.
+    fn target_scheduled_cus(&self) -> u64 {
+        self.config
+            .target_scheduled_cus
+            .unwrap_or(self.block_limit / BLOCK_LIMIT_IN_FLIGHT_DIVISOR)
     }
 
     /// FLOWRA Stage 0: rebuild `affinity_map` from the just-finished leader
@@ -389,6 +403,10 @@ impl<Tx: TransactionWithMeta> ConflictAwareScheduler<Tx> {
 }
 
 impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
+    fn set_block_limit(&mut self, block_limit: u64) {
+        self.block_limit = block_limit;
+    }
+
     fn schedule<S: StateContainer<Tx>>(
         &mut self,
         container: &mut S,
@@ -407,7 +425,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
         let starting_buffer_size = container.buffer_size();
 
         let num_threads = self.common.consume_work_senders.len();
-        let target_cu_per_thread = self.config.target_scheduled_cus / num_threads as u64;
+        let target_cu_per_thread = self.target_scheduled_cus() / num_threads as u64;
 
         let mut schedulable_threads = ThreadSet::any(num_threads);
         for thread_id in 0..num_threads {

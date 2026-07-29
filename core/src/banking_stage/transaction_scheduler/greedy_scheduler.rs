@@ -26,7 +26,11 @@ use {
 };
 
 pub(crate) struct GreedySchedulerConfig {
-    pub target_scheduled_cus: u64,
+    /// Explicit total in-flight CU budget across all worker threads. `None`
+    /// derives it from the leader bank's block cost limit, so it follows
+    /// feature-gated limit raises instead of freezing at the compile-time
+    /// constant. See [`GreedyScheduler::target_scheduled_cus`].
+    pub target_scheduled_cus: Option<u64>,
     pub max_scanned_transactions_per_scheduling_pass: usize,
     pub target_transactions_per_batch: usize,
 }
@@ -34,12 +38,18 @@ pub(crate) struct GreedySchedulerConfig {
 impl Default for GreedySchedulerConfig {
     fn default() -> Self {
         Self {
-            target_scheduled_cus: MAX_BLOCK_UNITS / 4,
+            target_scheduled_cus: None,
             max_scanned_transactions_per_scheduling_pass: 100_000,
             target_transactions_per_batch: TARGET_NUM_TRANSACTIONS_PER_BATCH,
         }
     }
 }
+
+/// Fraction of the block cost limit the scheduler may hold in flight when no
+/// explicit budget is configured. Upstream expressed this as
+/// `MAX_BLOCK_UNITS / 4`; taking it from the bank keeps the same ratio when the
+/// block limit is raised by feature activation (e.g. SIMD-0286's 60M -> 100M).
+pub(crate) const BLOCK_LIMIT_IN_FLIGHT_DIVISOR: u64 = 4;
 
 /// Dead-simple scheduler that is efficient and will attempt to schedule
 /// in priority order, scheduling anything that can be immediately
@@ -49,6 +59,9 @@ pub struct GreedyScheduler<Tx: TransactionWithMeta> {
     unschedulables: Vec<TransactionPriorityId>,
     config: GreedySchedulerConfig,
     bundle_account_locker: BundleAccountLocker,
+    /// Block cost limit of the current leader bank. Only consulted when
+    /// `config.target_scheduled_cus` is `None`.
+    block_limit: u64,
 }
 
 impl<Tx: TransactionWithMeta> GreedyScheduler<Tx> {
@@ -67,11 +80,23 @@ impl<Tx: TransactionWithMeta> GreedyScheduler<Tx> {
             ),
             config,
             bundle_account_locker,
+            block_limit: MAX_BLOCK_UNITS,
         }
+    }
+
+    /// Total in-flight CU the scheduler may hold across all worker threads.
+    fn target_scheduled_cus(&self) -> u64 {
+        self.config
+            .target_scheduled_cus
+            .unwrap_or(self.block_limit / BLOCK_LIMIT_IN_FLIGHT_DIVISOR)
     }
 }
 
 impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
+    fn set_block_limit(&mut self, block_limit: u64) {
+        self.block_limit = block_limit;
+    }
+
     fn schedule<S: StateContainer<Tx>>(
         &mut self,
         container: &mut S,
@@ -90,7 +115,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
         let starting_buffer_size = container.buffer_size();
 
         let num_threads = self.common.consume_work_senders.len();
-        let target_cu_per_thread = self.config.target_scheduled_cus / num_threads as u64;
+        let target_cu_per_thread = self.target_scheduled_cus() / num_threads as u64;
 
         let mut schedulable_threads = ThreadSet::any(num_threads);
         for thread_id in 0..num_threads {
@@ -338,6 +363,40 @@ mod test {
         )
     }
 
+    #[test]
+    fn default_in_flight_budget_follows_the_block_limit() {
+        // SIMD-0286 raised the block limit from 60M to 100M by feature activation. A budget
+        // pinned to the compile-time constant would stay sized for the old limit forever.
+        let (mut scheduler, _work_receivers, _finished_work_sender) = create_test_frame(
+            1,
+            GreedySchedulerConfig::default(),
+            BundleAccountLocker::default(),
+        );
+
+        // Before any leader bank is seen, fall back to the compile-time limit.
+        assert_eq!(scheduler.target_scheduled_cus(), MAX_BLOCK_UNITS / 4);
+
+        scheduler.set_block_limit(100_000_000);
+        assert_eq!(scheduler.target_scheduled_cus(), 25_000_000);
+    }
+
+    #[test]
+    fn explicit_in_flight_budget_ignores_the_block_limit() {
+        // An operator who passes the flag gets exactly what they asked for; a limit raise
+        // must not silently move it.
+        let (mut scheduler, _work_receivers, _finished_work_sender) = create_test_frame(
+            1,
+            GreedySchedulerConfig {
+                target_scheduled_cus: Some(50_000_000),
+                ..GreedySchedulerConfig::default()
+            },
+            BundleAccountLocker::default(),
+        );
+
+        scheduler.set_block_limit(100_000_000);
+        assert_eq!(scheduler.target_scheduled_cus(), 50_000_000);
+    }
+
     fn prioritized_tranfers(
         from_keypair: &Keypair,
         to_pubkeys: impl IntoIterator<Item = impl Borrow<Pubkey>>,
@@ -472,7 +531,7 @@ mod test {
         let (mut scheduler, work_receivers, _finished_work_sender) = create_test_frame(
             1,
             GreedySchedulerConfig {
-                target_scheduled_cus: 1, // only allow 1 transaction scheduled
+                target_scheduled_cus: Some(1), // only allow 1 transaction scheduled
                 ..GreedySchedulerConfig::default()
             },
             BundleAccountLocker::default(),
@@ -638,7 +697,7 @@ mod test {
         let (mut scheduler, work_receivers, _finished_work_sender) = create_test_frame(
             2,
             GreedySchedulerConfig {
-                target_scheduled_cus: 4 * 5_000, // 2 txs per thread
+                target_scheduled_cus: Some(4 * 5_000), // 2 txs per thread
                 ..GreedySchedulerConfig::default()
             },
             BundleAccountLocker::default(),
@@ -695,7 +754,7 @@ mod test {
         let (mut scheduler, work_receivers, _finished_work_sender) = create_test_frame(
             1,
             GreedySchedulerConfig {
-                target_scheduled_cus: 4 * 5_000, // 2 txs per thread
+                target_scheduled_cus: Some(4 * 5_000), // 2 txs per thread
                 ..GreedySchedulerConfig::default()
             },
             bundle_account_locker.clone(),
