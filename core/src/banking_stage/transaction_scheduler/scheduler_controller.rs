@@ -49,6 +49,20 @@ const DESATURATION_BUFFER_PCT: u8 = 95;
 #[derive(Clone)]
 pub struct SchedulerConfig {
     pub scheduler_pacing: SchedulerPacing,
+    /// Total in-flight CU the scheduler may hold across all worker threads.
+    /// `None` keeps the upstream value (`MAX_BLOCK_UNITS / 4`).
+    ///
+    /// This matters because the schedulers divide it by the worker count to get a
+    /// per-thread quota, and a thread over quota is dropped from the schedulable set for
+    /// the rest of the pass. A transaction whose accounts are already locked by that
+    /// thread has nowhere else to go, so it comes back as `UnschedulableThread`.
+    ///
+    /// Since the total is fixed, **raising the worker count shrinks every thread's quota**:
+    /// 4 workers get 3.75M CU each, 8 workers get 1.875M. That penalises exactly the
+    /// serialized hot-account chain that carries most of a block's compute. Measured on
+    /// mainnet with 8 workers, non-opening leader slots reported up to 11,866
+    /// `UnschedulableThread` against 996 scheduled.
+    pub target_scheduled_cus: Option<u64>,
 }
 
 impl Default for SchedulerConfig {
@@ -57,6 +71,7 @@ impl Default for SchedulerConfig {
             scheduler_pacing: SchedulerPacing::FillTimeMillis(
                 DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS,
             ),
+            target_scheduled_cus: None,
         }
     }
 }
