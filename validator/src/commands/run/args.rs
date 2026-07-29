@@ -1186,6 +1186,22 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help(BlockProductionMethod::cli_message()),
     )
     .arg(
+        Arg::with_name("block_production_target_scheduled_cus")
+            .long("block-production-target-scheduled-cus")
+            .value_name("CUS")
+            .takes_value(true)
+            .validator(is_parsable::<u64>)
+            .help(
+                "Total in-flight compute units the block-production scheduler may hold across \
+                 all worker threads. The scheduler divides this by --block-production-num-workers \
+                 to get a per-thread quota, and a thread over quota cannot accept a transaction \
+                 whose accounts it already holds locked. Leaving this at the default while \
+                 raising the worker count therefore shrinks each thread's quota. Defaults to \
+                 15000000 (a quarter of the block limit), which gives 3750000 per thread at the \
+                 default 4 workers; pass 3750000 x <workers> to keep that ratio.",
+            ),
+    )
+    .arg(
         Arg::with_name("block_production_pacing_fill_time_millis")
             .long("block-production-pacing-fill-time-millis")
             .value_name("MILLIS")

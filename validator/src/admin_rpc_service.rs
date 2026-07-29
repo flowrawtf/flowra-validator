@@ -291,6 +291,7 @@ pub trait AdminRpc {
         transaction_struct: TransactionStructure,
         num_workers: NonZeroUsize,
         scheduler_pacing: SchedulerPacing,
+        target_scheduled_cus: Option<u64>,
     ) -> Result<()>;
 
     #[rpc(meta, name = "isGeneratingSnapshots")]
@@ -954,6 +955,7 @@ impl AdminRpc for AdminRpcImpl {
         transaction_struct: TransactionStructure,
         num_workers: NonZeroUsize,
         scheduler_pacing: SchedulerPacing,
+        target_scheduled_cus: Option<u64>,
     ) -> Result<()> {
         debug!("manage_block_production rpc request received");
 
@@ -975,7 +977,10 @@ impl AdminRpc for AdminRpcImpl {
                 .try_send(BankingControlMsg::Internal {
                     block_production_method,
                     num_workers,
-                    config: SchedulerConfig { scheduler_pacing },
+                    config: SchedulerConfig {
+                        scheduler_pacing,
+                        target_scheduled_cus,
+                    },
                 })
                 .is_err()
             {

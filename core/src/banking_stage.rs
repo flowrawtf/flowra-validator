@@ -632,6 +632,18 @@ impl BankingStage {
             };
         }
 
+        // Total in-flight CU across all worker threads. The schedulers divide this by the
+        // worker count, so leaving it fixed while raising `--block-production-num-workers`
+        // silently shrinks each thread's quota — see `SchedulerConfig::target_scheduled_cus`.
+        let target_scheduled_cus = scheduler_config
+            .target_scheduled_cus
+            .unwrap_or(GreedySchedulerConfig::default().target_scheduled_cus);
+        info!(
+            "Scheduler in-flight CU budget: {target_scheduled_cus} total across {num_workers} \
+             worker(s) = {} per worker",
+            target_scheduled_cus / num_workers as u64
+        );
+
         // Both block production methods currently route to the greedy scheduler.
         // FLOWRA PoC: `FLOWRA_SCHEDULER=conflict-aware` selects the
         // conflict-aware scheduler; anything else keeps the default greedy
@@ -643,7 +655,10 @@ impl BankingStage {
             let scheduler = ConflictAwareScheduler::new(
                 work_senders,
                 finished_work_receiver,
-                ConflictAwareSchedulerConfig::default(),
+                ConflictAwareSchedulerConfig {
+                    target_scheduled_cus,
+                    ..ConflictAwareSchedulerConfig::default()
+                },
                 bundle_account_locker.clone(),
             );
             spawn_scheduler!(scheduler);
@@ -651,7 +666,10 @@ impl BankingStage {
             let scheduler = GreedyScheduler::new(
                 work_senders,
                 finished_work_receiver,
-                GreedySchedulerConfig::default(),
+                GreedySchedulerConfig {
+                    target_scheduled_cus,
+                    ..GreedySchedulerConfig::default()
+                },
                 bundle_account_locker.clone(),
             );
             spawn_scheduler!(scheduler);
