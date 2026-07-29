@@ -3181,7 +3181,7 @@ mod tests {
             bundle_stage::bundle_account_locker::BundleAccountLocker,
             proxy::block_engine_stage::BlockBuilderFeeInfo,
             tip_manager::{
-                TipDistributionAccountConfig, TipManager, TipManagerConfig,
+                TipDistributionAccountConfig, TipManagerConfig, TipManagers,
                 tip_payment::JitoTipPaymentConfig,
             },
         },
@@ -3297,7 +3297,7 @@ mod tests {
             consumed_sender,
             shared_leader_state.clone(),
             Some(TipProcessingDependencies {
-                tip_manager: TipManager::new(TipManagerConfig {
+                tip_managers: TipManagers::new(vec![TipManagerConfig {
                     tip_payment_program_id: Pubkey::new_from_array(
                         *jito_tip_payment::id().as_array(),
                     ),
@@ -3309,7 +3309,7 @@ mod tests {
                         vote_account: voting_keypair.pubkey(),
                         commission_bps: 0,
                     },
-                }),
+                }]),
                 last_tip_updated_slot: Arc::new(Mutex::new(0)),
                 block_builder_fee_info: Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                     block_builder: mint_keypair.pubkey(),

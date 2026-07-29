@@ -9,6 +9,11 @@ use {
 };
 
 pub(crate) trait Scheduler<Tx: TransactionWithMeta> {
+    /// Inform the scheduler of the current leader bank's block cost limit.
+    /// Schedulers that size their in-flight CU budget from the block limit use
+    /// this to follow feature-gated limit raises; the rest can ignore it.
+    fn set_block_limit(&mut self, _block_limit: u64) {}
+
     /// Schedule transactions from `container`.
     /// pre-graph and pre-lock filters may be passed to be applied
     /// before specific actions internally.

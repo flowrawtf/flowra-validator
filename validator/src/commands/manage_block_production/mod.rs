@@ -88,7 +88,7 @@ pub fn command(default_args: &DefaultArgs) -> App<'_, '_> {
                 .help(
                     "Total in-flight compute units the scheduler may hold across all worker \
                      threads; divided by --block-production-num-workers to get the per-thread \
-                     quota. Omit to keep the built-in 15000000.",
+                     quota. Omit to track a quarter of the bank's block cost limit.",
                 ),
         )
         .arg(

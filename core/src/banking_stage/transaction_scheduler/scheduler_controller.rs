@@ -50,7 +50,10 @@ const DESATURATION_BUFFER_PCT: u8 = 95;
 pub struct SchedulerConfig {
     pub scheduler_pacing: SchedulerPacing,
     /// Total in-flight CU the scheduler may hold across all worker threads.
-    /// `None` keeps the upstream value (`MAX_BLOCK_UNITS / 4`).
+    /// `None` derives it from the leader bank's block cost limit (a quarter of
+    /// it), so it tracks feature-gated limit raises — SIMD-0286 took the block
+    /// limit from 60M to 100M, and a hard-coded `MAX_BLOCK_UNITS / 4` would
+    /// have left the scheduler sized for the old limit indefinitely.
     ///
     /// This matters because the schedulers divide it by the worker count to get a
     /// per-thread quota, and a thread over quota is dropped from the schedulable set for
@@ -336,6 +339,13 @@ where
                         fill_time,
                     }
                 });
+
+                // The block limit changes on feature activation (SIMD-0286
+                // raised it from 60M to 100M), so a scheduler that derives its
+                // in-flight CU budget from it has to be told each leader slot.
+                if let Some(pacer) = cost_pacer.as_ref() {
+                    self.scheduler.set_block_limit(pacer.block_limit);
+                }
             }
 
             self.receive_completed(&decision)?;
