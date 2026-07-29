@@ -20,6 +20,8 @@ pub struct ManageBlockProductionArgs {
     pub transaction_structure: TransactionStructure,
     pub num_workers: NonZeroUsize,
     pub pacing_fill_time_millis: SchedulerPacing,
+    /// `None` keeps the built-in total. See `SchedulerConfig::target_scheduled_cus`.
+    pub target_scheduled_cus: Option<u64>,
 }
 
 impl FromClapArgMatches for ManageBlockProductionArgs {
@@ -39,6 +41,10 @@ impl FromClapArgMatches for ManageBlockProductionArgs {
                 "block_production_pacing_fill_time_millis",
                 SchedulerPacing
             )?,
+            target_scheduled_cus: matches
+                .is_present("block_production_target_scheduled_cus")
+                .then(|| value_t!(matches, "block_production_target_scheduled_cus", u64))
+                .transpose()?,
         })
     }
 }
@@ -74,6 +80,18 @@ pub fn command(default_args: &DefaultArgs) -> App<'_, '_> {
                 .help("Number of worker threads to use for block production"),
         )
         .arg(
+            Arg::with_name("block_production_target_scheduled_cus")
+                .long("block-production-target-scheduled-cus")
+                .alias("target-scheduled-cus")
+                .value_name("CUS")
+                .takes_value(true)
+                .help(
+                    "Total in-flight compute units the scheduler may hold across all worker \
+                     threads; divided by --block-production-num-workers to get the per-thread \
+                     quota. Omit to keep the built-in 15000000.",
+                ),
+        )
+        .arg(
             Arg::with_name("block_production_pacing_fill_time_millis")
                 .long("block-production-pacing-fill-time-millis")
                 .alias("pacing-fill-time-millis")
@@ -107,6 +125,7 @@ pub fn execute(matches: &ArgMatches, ledger_path: &Path) -> Result<()> {
                 manage_block_production_args.transaction_structure,
                 manage_block_production_args.num_workers,
                 manage_block_production_args.pacing_fill_time_millis,
+                manage_block_production_args.target_scheduled_cus,
             )
             .await
     })?;
@@ -136,6 +155,7 @@ mod tests {
                 transaction_structure: TransactionStructure::default(),
                 num_workers: BankingStage::default_num_workers(),
                 pacing_fill_time_millis: SchedulerConfig::default().scheduler_pacing,
+                target_scheduled_cus: None,
             }
         );
     }
@@ -154,6 +174,8 @@ mod tests {
             "4",
             "--block-production-pacing-fill-time-millis",
             "50",
+            "--block-production-target-scheduled-cus",
+            "30000000",
         ]);
         let args = ManageBlockProductionArgs::from_clap_arg_match(&matches).unwrap();
 
@@ -166,8 +188,20 @@ mod tests {
                 pacing_fill_time_millis: SchedulerPacing::FillTimeMillis(
                     NonZeroU64::new(50).unwrap()
                 ),
+                target_scheduled_cus: Some(30_000_000),
             }
         );
+    }
+
+    #[test]
+    fn target_scheduled_cus_is_none_unless_given() {
+        // Omitting the flag must leave the built-in total alone. If this ever defaults to a
+        // value, every operator silently changes scheduler behaviour on upgrade.
+        let default_args = DefaultArgs::default();
+        let app = command(&default_args);
+        let matches = app.get_matches_from(vec![COMMAND]);
+        let args = ManageBlockProductionArgs::from_clap_arg_match(&matches).unwrap();
+        assert_eq!(args.target_scheduled_cus, None);
     }
 
     #[test]
@@ -194,6 +228,7 @@ mod tests {
                 transaction_structure: TransactionStructure::Sdk,
                 num_workers: NonZeroUsize::new(4).unwrap(),
                 pacing_fill_time_millis: SchedulerPacing::Disabled,
+                target_scheduled_cus: None,
             }
         );
     }

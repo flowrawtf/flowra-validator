@@ -945,6 +945,9 @@ pub fn execute(
                 "block_production_pacing_fill_time_millis",
                 SchedulerPacing
             ),
+            target_scheduled_cus: matches
+                .is_present("block_production_target_scheduled_cus")
+                .then(|| value_t_or_exit!(matches, "block_production_target_scheduled_cus", u64)),
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
         enable_scheduler_bindings: matches.is_present("enable_scheduler_bindings"),
