@@ -1193,9 +1193,10 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                  all worker threads. The scheduler divides this by --block-production-num-workers \
                  to get a per-thread quota, and a thread over quota cannot accept a transaction \
                  whose accounts it already holds locked. Leaving this at the default while \
-                 raising the worker count therefore shrinks each thread's quota. Defaults to \
-                 15000000 (a quarter of the block limit), which gives 3750000 per thread at the \
-                 default 4 workers; pass 3750000 x <workers> to keep that ratio.",
+                 raising the worker count therefore shrinks each thread's quota. Omit to track a \
+                 quarter of the bank's block cost limit, which follows feature-gated limit \
+                 raises; pass (block limit / 4 / <workers>) x <workers> to keep that ratio at a \
+                 fixed value.",
             ),
     )
     .arg(
