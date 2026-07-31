@@ -61,6 +61,18 @@ pub(crate) struct ReceivingStats {
     pub num_dropped_on_lock_validation: usize,
     pub num_dropped_on_compute_budget: usize,
     pub num_dropped_on_age: usize,
+    /// Of the age drops, those whose blockhash the bank has never heard of — expired long
+    /// before it reached us, or never valid. These are clients retransmitting dead
+    /// transactions and nothing we do to our own pipeline can save them.
+    pub num_dropped_on_age_hash_unknown: usize,
+    /// Of the age drops, those whose blockhash IS still in the bank's queue but sits past
+    /// `max_processing_age`. These arrived late rather than dead, so they are the ones our
+    /// own latency could have rescued.
+    pub num_dropped_on_age_hash_known: usize,
+    /// Sum of the ages (in blockhash-queue entries) of the `hash_known` drops. Divided by
+    /// that count it gives the mean overshoot — the difference between "missed by two slots"
+    /// and "missed by fifty", which the single age counter cannot express.
+    pub dropped_on_age_slots_sum: u64,
     pub num_dropped_on_already_processed: usize,
     pub num_dropped_on_fee_payer: usize,
     pub num_dropped_on_filter_key: usize,
@@ -81,6 +93,9 @@ impl ReceivingStats {
         self.num_dropped_on_lock_validation += other.num_dropped_on_lock_validation;
         self.num_dropped_on_compute_budget += other.num_dropped_on_compute_budget;
         self.num_dropped_on_age += other.num_dropped_on_age;
+        self.num_dropped_on_age_hash_unknown += other.num_dropped_on_age_hash_unknown;
+        self.num_dropped_on_age_hash_known += other.num_dropped_on_age_hash_known;
+        self.dropped_on_age_slots_sum += other.dropped_on_age_slots_sum;
         self.num_dropped_on_already_processed += other.num_dropped_on_already_processed;
         self.num_dropped_on_fee_payer += other.num_dropped_on_fee_payer;
         self.num_dropped_on_filter_key += other.num_dropped_on_filter_key;
@@ -147,6 +162,9 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             num_dropped_on_lock_validation: 0,
             num_dropped_on_compute_budget: 0,
             num_dropped_on_age: 0,
+            num_dropped_on_age_hash_unknown: 0,
+            num_dropped_on_age_hash_known: 0,
+            dropped_on_age_slots_sum: 0,
             num_dropped_on_already_processed: 0,
             num_dropped_on_fee_payer: 0,
             num_dropped_on_filter_key: 0,
@@ -225,6 +243,9 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             num_dropped_on_lock_validation: stats.num_dropped_on_lock_validation,
             num_dropped_on_compute_budget: stats.num_dropped_on_compute_budget,
             num_dropped_on_age: stats.num_dropped_on_age,
+            num_dropped_on_age_hash_unknown: stats.num_dropped_on_age_hash_unknown,
+            num_dropped_on_age_hash_known: stats.num_dropped_on_age_hash_known,
+            dropped_on_age_slots_sum: stats.dropped_on_age_slots_sum,
             num_dropped_on_already_processed: stats.num_dropped_on_already_processed,
             num_dropped_on_fee_payer: stats.num_dropped_on_fee_payer,
             num_dropped_on_filter_key: stats.num_dropped_on_filter_key,
@@ -268,6 +289,9 @@ impl TransactionViewReceiveAndBuffer {
         let lock_results: [_; EXTRA_CAPACITY] = core::array::from_fn(|_| Ok(()));
         let mut error_counters = TransactionErrorMetrics::default();
         let mut num_dropped_on_age = 0;
+        let mut num_dropped_on_age_hash_unknown = 0;
+        let mut num_dropped_on_age_hash_known = 0;
+        let mut dropped_on_age_slots_sum = 0u64;
         let mut num_dropped_on_already_processed = 0;
         let mut num_dropped_on_fee_payer = 0;
         let mut num_dropped_on_filter_key = 0;
@@ -304,6 +328,24 @@ impl TransactionViewReceiveAndBuffer {
                         match err {
                             TransactionError::BlockhashNotFound => {
                                 num_dropped_on_age += 1;
+                                // Split "arrived late" from "was already dead". Over half of
+                                // everything we receive dies here, and the single counter
+                                // cannot say whether our own path is too slow or whether
+                                // clients are simply retransmitting expired transactions.
+                                // `get_hash_age` answers it: `None` means the bank has no
+                                // record of the blockhash at all.
+                                let transaction = container
+                                    .get_transaction(priority_id.id)
+                                    .expect("transaction must exist");
+                                match working_bank
+                                    .get_hash_age(transaction.recent_blockhash())
+                                {
+                                    Some(age) => {
+                                        num_dropped_on_age_hash_known += 1;
+                                        dropped_on_age_slots_sum += age;
+                                    }
+                                    None => num_dropped_on_age_hash_unknown += 1,
+                                }
                             }
                             TransactionError::AlreadyProcessed => {
                                 num_dropped_on_already_processed += 1;
@@ -416,6 +458,9 @@ impl TransactionViewReceiveAndBuffer {
             num_dropped_on_lock_validation,
             num_dropped_on_compute_budget,
             num_dropped_on_age,
+            num_dropped_on_age_hash_unknown,
+            num_dropped_on_age_hash_known,
+            dropped_on_age_slots_sum,
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_filter_key,
@@ -919,6 +964,9 @@ mod tests {
             num_dropped_on_lock_validation,
             num_dropped_on_compute_budget,
             num_dropped_on_age,
+            num_dropped_on_age_hash_unknown: _,
+            num_dropped_on_age_hash_known: _,
+            dropped_on_age_slots_sum: _,
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_filter_key: _,
@@ -977,6 +1025,9 @@ mod tests {
             num_dropped_on_lock_validation,
             num_dropped_on_compute_budget,
             num_dropped_on_age,
+            num_dropped_on_age_hash_unknown: _,
+            num_dropped_on_age_hash_known: _,
+            dropped_on_age_slots_sum: _,
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_filter_key: _,
@@ -1021,6 +1072,9 @@ mod tests {
             num_dropped_on_lock_validation,
             num_dropped_on_compute_budget,
             num_dropped_on_age,
+            num_dropped_on_age_hash_unknown: _,
+            num_dropped_on_age_hash_known: _,
+            dropped_on_age_slots_sum: _,
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_filter_key: _,
@@ -1064,6 +1118,9 @@ mod tests {
             num_dropped_on_lock_validation,
             num_dropped_on_compute_budget,
             num_dropped_on_age,
+            num_dropped_on_age_hash_unknown,
+            num_dropped_on_age_hash_known,
+            dropped_on_age_slots_sum,
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_filter_key: _,
@@ -1081,6 +1138,11 @@ mod tests {
         assert_eq!(num_dropped_on_lock_validation, 0);
         assert_eq!(num_dropped_on_compute_budget, 0);
         assert_eq!(num_dropped_on_age, 1);
+        // The whole point of the split: this transaction carries a blockhash the bank has
+        // never seen, so it must land in `hash_unknown` — "already dead", not "arrived late".
+        assert_eq!(num_dropped_on_age_hash_unknown, 1);
+        assert_eq!(num_dropped_on_age_hash_known, 0);
+        assert_eq!(dropped_on_age_slots_sum, 0);
         assert_eq!(num_dropped_on_already_processed, 0);
         assert_eq!(num_dropped_on_fee_payer, 0);
         assert_eq!(num_dropped_on_capacity, 0);
@@ -1115,6 +1177,9 @@ mod tests {
             num_dropped_on_lock_validation,
             num_dropped_on_compute_budget,
             num_dropped_on_age,
+            num_dropped_on_age_hash_unknown: _,
+            num_dropped_on_age_hash_known: _,
+            dropped_on_age_slots_sum: _,
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_filter_key: _,
@@ -1181,6 +1246,9 @@ mod tests {
             num_dropped_on_lock_validation,
             num_dropped_on_compute_budget,
             num_dropped_on_age,
+            num_dropped_on_age_hash_unknown: _,
+            num_dropped_on_age_hash_known: _,
+            dropped_on_age_slots_sum: _,
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_filter_key: _,
@@ -1232,6 +1300,9 @@ mod tests {
             num_dropped_on_lock_validation,
             num_dropped_on_compute_budget,
             num_dropped_on_age,
+            num_dropped_on_age_hash_unknown: _,
+            num_dropped_on_age_hash_known: _,
+            dropped_on_age_slots_sum: _,
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_filter_key: _,
@@ -1378,6 +1449,9 @@ mod tests {
             num_dropped_on_lock_validation,
             num_dropped_on_compute_budget,
             num_dropped_on_age,
+            num_dropped_on_age_hash_unknown: _,
+            num_dropped_on_age_hash_known: _,
+            dropped_on_age_slots_sum: _,
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_filter_key: _,
@@ -1461,6 +1535,9 @@ mod tests {
             num_dropped_on_lock_validation,
             num_dropped_on_compute_budget,
             num_dropped_on_age,
+            num_dropped_on_age_hash_unknown: _,
+            num_dropped_on_age_hash_known: _,
+            dropped_on_age_slots_sum: _,
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_filter_key: _,

@@ -503,6 +503,9 @@ where
                 num_dropped_on_lock_validation,
                 num_dropped_on_compute_budget,
                 num_dropped_on_age,
+                num_dropped_on_age_hash_unknown,
+                num_dropped_on_age_hash_known,
+                dropped_on_age_slots_sum,
                 num_dropped_on_already_processed,
                 num_dropped_on_fee_payer,
                 num_dropped_on_filter_key,
@@ -519,6 +522,10 @@ where
             count_metrics.num_dropped_on_validate_locks += *num_dropped_on_lock_validation;
             count_metrics.num_dropped_on_receive_compute_budget += *num_dropped_on_compute_budget;
             count_metrics.num_dropped_on_receive_age += *num_dropped_on_age;
+            count_metrics.num_dropped_on_receive_age_hash_unknown +=
+                *num_dropped_on_age_hash_unknown;
+            count_metrics.num_dropped_on_receive_age_hash_known += *num_dropped_on_age_hash_known;
+            count_metrics.dropped_on_receive_age_slots_sum += *dropped_on_age_slots_sum;
             count_metrics.num_dropped_on_receive_already_processed +=
                 *num_dropped_on_already_processed;
             count_metrics.num_dropped_on_receive_fee_payer += *num_dropped_on_fee_payer;
