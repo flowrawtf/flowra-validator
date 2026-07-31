@@ -94,6 +94,13 @@ pub struct SchedulerCountMetricsInner {
     pub num_dropped_on_receive_compute_budget: Saturating<usize>,
     /// Number of transactions that were dropped due to age/nonce during receive checks.
     pub num_dropped_on_receive_age: Saturating<usize>,
+    /// Age drops whose blockhash the bank has no record of — dead before it reached us.
+    pub num_dropped_on_receive_age_hash_unknown: Saturating<usize>,
+    /// Age drops whose blockhash is still in the queue, just past `max_processing_age`.
+    /// These are the ones a faster path could have saved.
+    pub num_dropped_on_receive_age_hash_known: Saturating<usize>,
+    /// Sum of ages of the `hash_known` drops; over their count it is the mean overshoot.
+    pub dropped_on_receive_age_slots_sum: Saturating<u64>,
     /// Number of transactions that were dropped due to already processed during receive checks.
     pub num_dropped_on_receive_already_processed: Saturating<usize>,
     /// Number of transactions that were dropped on fee payer checks during receive checks.
@@ -154,6 +161,11 @@ impl SchedulerCountMetricsInner {
             num_dropped_on_validate_locks: Saturating(num_dropped_on_validate_locks),
             num_dropped_on_receive_compute_budget: Saturating(num_dropped_on_receive_compute_budget),
             num_dropped_on_receive_age: Saturating(num_dropped_on_receive_age),
+            num_dropped_on_receive_age_hash_unknown:
+                Saturating(num_dropped_on_receive_age_hash_unknown),
+            num_dropped_on_receive_age_hash_known:
+                Saturating(num_dropped_on_receive_age_hash_known),
+            dropped_on_receive_age_slots_sum: Saturating(dropped_on_receive_age_slots_sum),
             num_dropped_on_receive_already_processed:
                 Saturating(num_dropped_on_receive_already_processed),
             num_dropped_on_receive_fee_payer: Saturating(num_dropped_on_receive_fee_payer),
@@ -191,6 +203,21 @@ impl SchedulerCountMetricsInner {
                 i64
             ),
             ("num_dropped_on_receive_age", num_dropped_on_receive_age, i64),
+            (
+                "num_dropped_on_receive_age_hash_unknown",
+                num_dropped_on_receive_age_hash_unknown,
+                i64
+            ),
+            (
+                "num_dropped_on_receive_age_hash_known",
+                num_dropped_on_receive_age_hash_known,
+                i64
+            ),
+            (
+                "dropped_on_receive_age_slots_sum",
+                dropped_on_receive_age_slots_sum,
+                i64
+            ),
             (
                 "num_dropped_on_receive_already_processed",
                 num_dropped_on_receive_already_processed,
@@ -242,6 +269,9 @@ impl SchedulerCountMetricsInner {
         self.num_dropped_on_validate_locks = Saturating(0);
         self.num_dropped_on_receive_compute_budget = Saturating(0);
         self.num_dropped_on_receive_age = Saturating(0);
+        self.num_dropped_on_receive_age_hash_unknown = Saturating(0);
+        self.num_dropped_on_receive_age_hash_known = Saturating(0);
+        self.dropped_on_receive_age_slots_sum = Saturating(0);
         self.num_dropped_on_receive_already_processed = Saturating(0);
         self.num_dropped_on_receive_fee_payer = Saturating(0);
         self.num_dropped_on_clear = Saturating(0);
