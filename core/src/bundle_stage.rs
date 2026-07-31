@@ -91,6 +91,18 @@ pub struct BundleStageLoopMetrics {
     tip_programs_error: Saturating<u64>,
     bundle_lock_errors: Saturating<u64>,
     bundles_processed: Saturating<u64>,
+
+    // Where buffered bundles actually go. Every exit from the buffer used to be counted
+    // *except* the two that fire in practice: the `Forward` branch clears the whole buffer,
+    // and a failed execution destroys or retries the bundle. With 13 bundles received, 0
+    // processed and every drop counter reading 0, the buffer still drained — the evidence
+    // for why simply did not exist. These close that hole.
+    decision_consume: Saturating<u64>,
+    decision_forward: Saturating<u64>,
+    decision_hold: Saturating<u64>,
+    num_bundles_cleared_on_forward: Saturating<u64>,
+    num_bundles_error_retryable: Saturating<u64>,
+    num_bundles_error_non_retryable: Saturating<u64>,
 }
 
 impl Default for BundleStageLoopMetrics {
@@ -116,6 +128,12 @@ impl Default for BundleStageLoopMetrics {
             tip_programs_error: Saturating(0),
             bundle_lock_errors: Saturating(0),
             bundles_processed: Saturating(0),
+            decision_consume: Saturating(0),
+            decision_forward: Saturating(0),
+            decision_hold: Saturating(0),
+            num_bundles_cleared_on_forward: Saturating(0),
+            num_bundles_error_retryable: Saturating(0),
+            num_bundles_error_non_retryable: Saturating(0),
         }
     }
 }
@@ -155,6 +173,30 @@ impl BundleStageLoopMetrics {
 
     pub fn increment_bundles_processed(&mut self, count: u64) {
         self.bundles_processed += count;
+    }
+
+    pub fn increment_decision_consume(&mut self) {
+        self.decision_consume += 1;
+    }
+
+    pub fn increment_decision_forward(&mut self) {
+        self.decision_forward += 1;
+    }
+
+    pub fn increment_decision_hold(&mut self) {
+        self.decision_hold += 1;
+    }
+
+    pub fn increment_bundles_cleared_on_forward(&mut self, count: u64) {
+        self.num_bundles_cleared_on_forward += count;
+    }
+
+    pub fn increment_bundle_error_retryable(&mut self) {
+        self.num_bundles_error_retryable += 1;
+    }
+
+    pub fn increment_bundle_error_non_retryable(&mut self) {
+        self.num_bundles_error_non_retryable += 1;
     }
 
     pub fn increment_bundle_dropped_error(&mut self, error: BundleStorageError) {
@@ -267,6 +309,29 @@ impl BundleStageLoopMetrics {
                 ("tip_programs_error", self.tip_programs_error.0 as i64, i64),
                 ("bundle_lock_errors", self.bundle_lock_errors.0 as i64, i64),
                 ("bundles_processed", self.bundles_processed.0 as i64, i64),
+                (
+                    "cost_model_buffered_bundles_count",
+                    self.cost_model_buffered_bundles_count.0 as i64,
+                    i64
+                ),
+                ("decision_consume", self.decision_consume.0 as i64, i64),
+                ("decision_forward", self.decision_forward.0 as i64, i64),
+                ("decision_hold", self.decision_hold.0 as i64, i64),
+                (
+                    "num_bundles_cleared_on_forward",
+                    self.num_bundles_cleared_on_forward.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_error_retryable",
+                    self.num_bundles_error_retryable.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_error_non_retryable",
+                    self.num_bundles_error_non_retryable.0 as i64,
+                    i64
+                ),
             );
 
             self.last_report = Instant::now();
@@ -293,6 +358,12 @@ impl BundleStageLoopMetrics {
         self.tip_programs_error = Saturating(0);
         self.bundle_lock_errors = Saturating(0);
         self.bundles_processed = Saturating(0);
+        self.decision_consume = Saturating(0);
+        self.decision_forward = Saturating(0);
+        self.decision_hold = Saturating(0);
+        self.num_bundles_cleared_on_forward = Saturating(0);
+        self.num_bundles_error_retryable = Saturating(0);
+        self.num_bundles_error_non_retryable = Saturating(0);
     }
 
     pub fn has_data(&self) -> bool {
@@ -312,6 +383,9 @@ impl BundleStageLoopMetrics {
             || self.tip_programs_error.0 > 0
             || self.bundle_lock_errors.0 > 0
             || self.bundles_processed.0 > 0
+            || self.num_bundles_cleared_on_forward.0 > 0
+            || self.num_bundles_error_retryable.0 > 0
+            || self.num_bundles_error_non_retryable.0 > 0
     }
 }
 
@@ -553,6 +627,7 @@ impl BundleStage {
             // BufferedPacketsDecision::Consume means this leader is scheduled to be running at the moment.
             // Execute, record, and commit as many bundles possible given time, compute, and other constraints.
             BufferedPacketsDecision::Consume(bank) => {
+                bundle_stage_metrics.increment_decision_consume();
                 Self::consume_bundles(
                     &bank,
                     bundle_storage,
@@ -569,12 +644,23 @@ impl BundleStage {
             // BufferedPacketsDecision::Forward means the leader is slot is far away.
             // Bundles aren't forwarded because it breaks atomicity guarantees, so just drop them.
             BufferedPacketsDecision::Forward => {
+                // Silently discarding a buffered bundle here is by design (forwarding one
+                // would break atomicity), but it is indistinguishable from "we executed it"
+                // unless it is counted — this branch is the buffer's busiest exit.
+                bundle_stage_metrics.increment_decision_forward();
+                bundle_stage_metrics.increment_bundles_cleared_on_forward(
+                    (bundle_storage.unprocessed_bundles_len()
+                        + bundle_storage.cost_model_buffered_bundles_len())
+                        as u64,
+                );
                 bundle_storage.clear();
             }
             // BufferedPacketsDecision::ForwardAndHold | BufferedPacketsDecision::Hold means the validator
             // is approaching the leader slot, hold bundles. Also, bundles aren't forwarded because it breaks
             // atomicity guarantees
-            BufferedPacketsDecision::ForwardAndHold | BufferedPacketsDecision::Hold => {}
+            BufferedPacketsDecision::ForwardAndHold | BufferedPacketsDecision::Hold => {
+                bundle_stage_metrics.increment_decision_hold();
+            }
         }
     }
 
@@ -662,9 +748,17 @@ impl BundleStage {
                     bundle_storage.destroy_bundle(bundle);
                 }
                 Err(BundleExecutionError::ErrorRetryable) => {
+                    bundle_stage_metrics.increment_bundle_error_retryable();
+                    // `set_has_data` gates the whole ConsumeWorkerMetrics report, and only the
+                    // success path set it — so the per-TransactionError breakdown that names
+                    // *why* a bundle failed was collected and then thrown away. A failed
+                    // bundle is exactly when we need it.
+                    consume_worker_metrics.set_has_data(true);
                     bundle_storage.retry_bundle(bundle);
                 }
                 Err(BundleExecutionError::ErrorNonRetryable) => {
+                    bundle_stage_metrics.increment_bundle_error_non_retryable();
+                    consume_worker_metrics.set_has_data(true);
                     bundle_storage.destroy_bundle(bundle);
                 }
                 Err(BundleExecutionError::TipError) => {
