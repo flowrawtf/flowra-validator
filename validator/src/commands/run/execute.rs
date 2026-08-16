@@ -153,6 +153,23 @@ pub fn execute(
     info!("{} {}", crate_name!(), solana_version);
     info!("Starting validator with: {:#?}", std::env::args_os());
 
+    // Decided before the first data point can be produced. Off means nothing leaves the box:
+    // see solana_metrics::set_export_enabled.
+    let debug_telemetry = matches.is_present("flowra_debug_telemetry")
+        || matches!(
+            std::env::var("FLOWRA_DEBUG_TELEMETRY").as_deref(),
+            Ok("1") | Ok("true")
+        );
+    solana_metrics::set_export_enabled(debug_telemetry);
+    if debug_telemetry {
+        info!("debug telemetry enabled: metrics will be exported to SOLANA_METRICS_CONFIG");
+    } else if std::env::var_os("SOLANA_METRICS_CONFIG").is_some() {
+        warn!(
+            "SOLANA_METRICS_CONFIG is set but metrics export is off; pass \
+             --flowra-debug-telemetry to enable it"
+        );
+    }
+
     solana_metrics::set_host_id(identity_keypair.pubkey().to_string());
     solana_metrics::set_panic_hook("validator", Some(String::from(solana_version)));
     solana_entry::entry::init_poh();

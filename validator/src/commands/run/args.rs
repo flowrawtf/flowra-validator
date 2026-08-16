@@ -1370,6 +1370,19 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("DEPRECATED and ignored. No block CU is reserved for bundles."),
     )
     .arg(
+        Arg::with_name("flowra_debug_telemetry")
+            .long("flowra-debug-telemetry")
+            .takes_value(false)
+            .help(
+                "Export metrics to the host named by SOLANA_METRICS_CONFIG. Off by default: \
+                 this fork carries extra instrumentation that is only useful to whoever is \
+                 debugging it, and without this flag the validator does not queue, serialize \
+                 or transmit a single data point, and opens no connection to a metrics host. \
+                 SOLANA_METRICS_CONFIG alone does nothing. FLOWRA_DEBUG_TELEMETRY=1 has the \
+                 same effect as passing this flag.",
+            ),
+    )
+    .arg(
         Arg::with_name("shred_receiver_address")
             .long("shred-receiver-address")
             .value_name("SHRED_RECEIVER_ADDRESS")
