@@ -231,7 +231,6 @@ pub(crate) fn calculate_priority_from_bytes(bank: &Bank, data: &[u8]) -> Option<
 mod tests {
     use {
         super::*,
-
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
         solana_keypair::Keypair,

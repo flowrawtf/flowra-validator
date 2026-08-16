@@ -90,7 +90,6 @@ impl JitoTipPaymentConfig {
     pub fn block_builder_commission_pct(&self) -> u64 {
         self.block_builder_commission_pct
     }
-
 }
 
 /// https://github.com/jito-foundation/jito-programs/blob/8f55af0a9b31ac2192415b59ce2c47329ee255a2/mev-programs/programs/tip-payment/src/lib.rs#L362

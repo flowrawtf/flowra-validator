@@ -428,7 +428,9 @@ impl TipManager {
                 // change_tip_receiver must not point at a TDA that failed to be created:
                 // tips swept there afterwards would land on an unowned address.
                 blocking: true,
-                txs: smallvec::smallvec![self.initialize_tip_distribution_account_tx(bank, keypair)?],
+                txs: smallvec::smallvec![
+                    self.initialize_tip_distribution_account_tx(bank, keypair)?
+                ],
             });
         }
 
@@ -594,7 +596,10 @@ impl TipManagers {
             .iter()
             .flat_map(|m| m.get_tip_accounts().iter().copied())
             .collect();
-        Self { managers, tip_accounts }
+        Self {
+            managers,
+            tip_accounts,
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &TipManager> {
