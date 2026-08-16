@@ -998,9 +998,17 @@ impl BlockEngineStage {
                         let program_ids = q
                             .get("program_ids")
                             .and_then(|v| v.as_array())
-                            .map(|p| p.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .map(|p| {
+                                p.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default();
-                        Some(block_engine::CategoryQuota { name, pct, program_ids })
+                        Some(block_engine::CategoryQuota {
+                            name,
+                            pct,
+                            program_ids,
+                        })
                     })
                     .collect()
             })
@@ -1067,9 +1075,9 @@ impl BlockEngineStage {
                 if upstream_url.starts_with("https://") {
                     // with_enabled_roots() is load-bearing: ClientTlsConfig::new() carries no
                     // trust anchors at all, so the handshake fails as a bare "transport error".
-                    match ep.tls_config(
-                        tonic::transport::ClientTlsConfig::new().with_enabled_roots(),
-                    ) {
+                    match ep
+                        .tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())
+                    {
                         Ok(ep) => ep,
                         Err(e) => {
                             warn!("upstream {upstream_url}: tls config failed: {e}");
@@ -1120,10 +1128,7 @@ impl BlockEngineStage {
         // Next mint is driven by this token's own lifetime.
         let lifetime = expires_at
             .and_then(|ts| {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .ok()?
-                    .as_secs() as i64;
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
                 u64::try_from(ts.seconds.saturating_sub(now)).ok()
             })
             .map(Duration::from_secs);

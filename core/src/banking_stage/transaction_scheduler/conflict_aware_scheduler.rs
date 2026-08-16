@@ -485,28 +485,27 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
             // account) and (b) capture the write keys for this-slot CU
             // accumulation. Cheap no-op when Stage 0 is disabled.
             let mut write_keys_buf: Vec<Pubkey> = Vec::new();
-            let preferred_thread: Option<ThreadId> = if self.stage0_enabled
-                || self.cooc_probe_enabled
-            {
-                let transaction = transaction_state.transaction();
-                let account_keys = transaction.account_keys();
-                let mut best: Option<(ThreadId, u64)> = None;
-                for (index, key) in account_keys.iter().enumerate() {
-                    if transaction.is_writable(index) {
-                        write_keys_buf.push(*key);
-                        if self.stage0_enabled {
-                            if let Some(&(thread_id, cu)) = self.affinity_map.get(key) {
-                                if best.is_none_or(|(_, best_cu)| cu > best_cu) {
-                                    best = Some((thread_id, cu));
+            let preferred_thread: Option<ThreadId> =
+                if self.stage0_enabled || self.cooc_probe_enabled {
+                    let transaction = transaction_state.transaction();
+                    let account_keys = transaction.account_keys();
+                    let mut best: Option<(ThreadId, u64)> = None;
+                    for (index, key) in account_keys.iter().enumerate() {
+                        if transaction.is_writable(index) {
+                            write_keys_buf.push(*key);
+                            if self.stage0_enabled {
+                                if let Some(&(thread_id, cu)) = self.affinity_map.get(key) {
+                                    if best.is_none_or(|(_, best_cu)| cu > best_cu) {
+                                        best = Some((thread_id, cu));
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                best.map(|(thread_id, _)| thread_id)
-            } else {
-                None
-            };
+                    best.map(|(thread_id, _)| thread_id)
+                } else {
+                    None
+                };
 
             // FLOWRA PoC: this is where conflict-aware ordering diverges from the
             // greedy scheduler. Stage 0 steers the thread choice toward a hot

@@ -163,8 +163,7 @@ impl SchedulerCountMetricsInner {
             num_dropped_on_receive_age: Saturating(num_dropped_on_receive_age),
             num_dropped_on_receive_age_hash_unknown:
                 Saturating(num_dropped_on_receive_age_hash_unknown),
-            num_dropped_on_receive_age_hash_known:
-                Saturating(num_dropped_on_receive_age_hash_known),
+            num_dropped_on_receive_age_hash_known: Saturating(num_dropped_on_receive_age_hash_known),
             dropped_on_receive_age_slots_sum: Saturating(dropped_on_receive_age_slots_sum),
             num_dropped_on_receive_already_processed:
                 Saturating(num_dropped_on_receive_already_processed),

@@ -1154,8 +1154,9 @@ mod tests {
         // initialize tip distribution config
         // initialize tip payment config
         // initialize tip distribution account
-        // change tip receiver and block builder
-        const NUM_TXS_EXPECTED: usize = 4;
+        // change tip receiver
+        // change block builder
+        const NUM_TXS_EXPECTED: usize = 5;
         let mut tx_count = 0;
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(2) {
@@ -1295,7 +1296,7 @@ mod tests {
         verified_bundle_sender.send(verified_bundle).unwrap();
 
         let start = Instant::now();
-        const MAX_EXPECTED_TXS: usize = 4;
+        const MAX_EXPECTED_TXS: usize = 5;
         let mut tx_count = 0;
         while start.elapsed() < Duration::from_secs(2) {
             if let Ok((_bank, (EntryOrMarker::Entry(entry), _tick_height))) =
@@ -1402,7 +1403,7 @@ mod tests {
         verified_bundle_sender.send(verified_bundle).unwrap();
 
         let start = Instant::now();
-        const MAX_EXPECTED_TXS: usize = 6; // 4 initial for tips + 2 transfers
+        const MAX_EXPECTED_TXS: usize = 7; // 5 initial for tips + 2 transfers
         let mut tx_count = 0;
         while start.elapsed() < Duration::from_secs(2) {
             if let Ok((_bank, (EntryOrMarker::Entry(entry), _tick_height))) =
@@ -1528,7 +1529,7 @@ mod tests {
         verified_bundle_sender.send(verified_bundle).unwrap();
 
         let start = Instant::now();
-        const MAX_EXPECTED_TXS: usize = 4; // 4 initial for tips
+        const MAX_EXPECTED_TXS: usize = 5; // 5 initial for tips
         let mut tx_count = 0;
         while start.elapsed() < Duration::from_secs(2) {
             if let Ok((_bank, (EntryOrMarker::Entry(entry), _tick_height))) =
@@ -1627,7 +1628,7 @@ mod tests {
         verified_bundle_sender.send(verified_bundle).unwrap();
 
         let start = Instant::now();
-        const MAX_EXPECTED_TXS: usize = 5; // 4 initial for tips
+        const MAX_EXPECTED_TXS: usize = 6; // 5 initial for tips + 1
         let mut tx_count = 0;
         while start.elapsed() < Duration::from_secs(2) {
             if let Ok((_bank, (EntryOrMarker::Entry(entry), _tick_height))) =
@@ -1678,6 +1679,3 @@ mod tests {
         drop(verified_bundle_sender);
     }
 }
-
-
-

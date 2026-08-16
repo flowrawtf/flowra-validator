@@ -249,7 +249,8 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
         for tip_manager in tip_managers.iter() {
             let program = tip_manager.tip_payment_program_id();
 
-            if let Ok(init_bundle) = tip_manager.get_initialize_tip_programs_bundle(bank, &keypair) {
+            if let Ok(init_bundle) = tip_manager.get_initialize_tip_programs_bundle(bank, &keypair)
+            {
                 if !init_bundle.is_empty()
                     && !self.commit_upkeep(bank, &init_bundle, bundle_account_locker)
                 {
@@ -269,7 +270,10 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
             };
             for step in steps {
                 if !self.commit_upkeep(bank, &step.txs, bundle_account_locker) {
-                    warn!("tip program {program} crank step {} did not commit", step.label);
+                    warn!(
+                        "tip program {program} crank step {} did not commit",
+                        step.label
+                    );
                     all_ok = false;
                     if step.blocking {
                         break;

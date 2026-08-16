@@ -36,15 +36,11 @@ use {
         runtime_transaction::RuntimeTransaction, sanitize_config::sanitize_config,
         transaction_meta::TransactionMeta, transaction_with_meta::TransactionWithMeta,
     },
-    solana_sdk_ids::system_program,
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransactionError,
-    std::{
-        sync::{Arc, OnceLock},
-        time::Instant,
-    },
+    std::{sync::Arc, time::Instant},
 };
 
 #[derive(Debug)]
@@ -341,9 +337,7 @@ impl TransactionViewReceiveAndBuffer {
                                 let transaction = container
                                     .get_transaction(priority_id.id)
                                     .expect("transaction must exist");
-                                match working_bank
-                                    .get_hash_age(transaction.recent_blockhash())
-                                {
+                                match working_bank.get_hash_age(transaction.recent_blockhash()) {
                                     Some(age) => {
                                         num_dropped_on_age_hash_known += 1;
                                         dropped_on_age_slots_sum += age;
