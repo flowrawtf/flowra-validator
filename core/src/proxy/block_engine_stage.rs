@@ -26,6 +26,7 @@ use {
             self, BlockBuilderFeeInfoRequest, BlockEngineEndpoint, GetBlockEngineEndpointRequest,
             block_engine_validator_client::BlockEngineValidatorClient,
         },
+        shared,
     },
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
@@ -960,19 +961,19 @@ impl BlockEngineStage {
 
     /// Path to the validator-owned PBP policy file, if configured via env.
     /// The validator is the policy authority; it pushes this to the block engine.
-    fn pbp_config_path() -> Option<std::path::PathBuf> {
+    pub(crate) fn pbp_config_path() -> Option<std::path::PathBuf> {
         std::env::var("FLOWRA_PBP_CONFIG")
             .ok()
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from)
     }
 
-    fn pbp_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    pub(crate) fn pbp_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
         std::fs::metadata(path).and_then(|m| m.modified()).ok()
     }
 
     /// Parse the PBP TOML into a wire PbpPolicy message.
-    fn load_pbp_policy(path: &std::path::Path) -> Option<block_engine::PbpPolicy> {
+    pub(crate) fn load_pbp_policy(path: &std::path::Path) -> Option<shared::PbpPolicy> {
         let content = std::fs::read_to_string(path).ok()?;
         let val: toml::Value = toml::from_str(&content).ok()?;
         let arr = |table: &str, key: &str| -> Vec<String> {
@@ -987,7 +988,7 @@ impl BlockEngineStage {
                 .unwrap_or_default()
         };
         // E3: parse the `[[category_quotas]]` array-of-tables (name, pct, program_ids).
-        let category_quotas: Vec<block_engine::CategoryQuota> = val
+        let category_quotas: Vec<shared::CategoryQuota> = val
             .get("category_quotas")
             .and_then(|v| v.as_array())
             .map(|a| {
@@ -1004,7 +1005,7 @@ impl BlockEngineStage {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        Some(block_engine::CategoryQuota {
+                        Some(shared::CategoryQuota {
                             name,
                             pct,
                             program_ids,
@@ -1014,7 +1015,7 @@ impl BlockEngineStage {
             })
             .unwrap_or_default();
 
-        Some(block_engine::PbpPolicy {
+        Some(shared::PbpPolicy {
             allow_aggressive_mev: val
                 .get("policy")
                 .and_then(|p| p.get("allow_aggressive_mev"))
@@ -1027,6 +1028,33 @@ impl BlockEngineStage {
             program_allowlist: arr("program_allowlist", "program_ids"),
             force_priority_searchers: arr("force_priority", "searchers"),
             category_quotas,
+            // [[instruction_blacklist]] entries: program_id + hex data prefixes, for naming one
+            // instruction of an otherwise legitimate program.
+            instruction_blacklist: val
+                .get("instruction_blacklist")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|rule| {
+                            Some(shared::InstructionRule {
+                                program_id: rule
+                                    .get("program_id")
+                                    .and_then(|v| v.as_str())?
+                                    .to_string(),
+                                data_prefixes: rule
+                                    .get("data_prefixes")
+                                    .and_then(|v| v.as_array())
+                                    .map(|p| {
+                                        p.iter()
+                                            .filter_map(|x| x.as_str().map(String::from))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
