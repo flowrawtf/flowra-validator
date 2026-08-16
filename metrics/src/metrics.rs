@@ -13,7 +13,10 @@ use {
         convert::Into,
         env,
         fmt::Write,
-        sync::{Arc, Barrier, Mutex, Once, RwLock},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier, Mutex, Once, RwLock,
+        },
         thread,
         time::{Duration, Instant, UNIX_EPOCH},
     },
@@ -412,9 +415,35 @@ pub fn get_host_id() -> String {
     HOST_ID.read().unwrap().clone()
 }
 
+/// Whether this process ships metrics off the box at all.
+///
+/// This fork adds instrumentation of its own and points `SOLANA_METRICS_CONFIG` at a
+/// Flowra-operated collector, so shipping points has to be something an operator switches
+/// on deliberately rather than something the binary does on its own. `submit` and
+/// `submit_counter` are the only two doors every `datapoint_*` and counter goes through, so
+/// gating them here means a disabled process never queues, serializes or transmits a point,
+/// and never opens a connection to a metrics host.
+///
+/// Defaults to on so the rest of the tree — ledger-tool, the test suites, anything linking
+/// this crate — behaves exactly as upstream. The validator's `run` command turns it off
+/// unless `--flowra-debug-telemetry` is passed.
+static EXPORT_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Turn metrics export on or off for the whole process. Call before any point is submitted.
+pub fn set_export_enabled(enabled: bool) {
+    EXPORT_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn export_enabled() -> bool {
+    EXPORT_ENABLED.load(Ordering::Relaxed)
+}
+
 /// Submits a new point from any thread.  Note that points are internally queued
 /// and transmitted periodically in batches.
 pub fn submit(point: DataPoint, level: log::Level) {
+    if !export_enabled() {
+        return;
+    }
     let agent = get_singleton_agent();
     agent.submit(point, level);
 }
@@ -422,6 +451,9 @@ pub fn submit(point: DataPoint, level: log::Level) {
 /// Submits a new counter or updates an existing counter from any thread.  Note that points are
 /// internally queued and transmitted periodically in batches.
 pub(crate) fn submit_counter(point: CounterPoint, level: log::Level, bucket: u64) {
+    if !export_enabled() {
+        return;
+    }
     let agent = get_singleton_agent();
     agent.submit_counter(point, level, bucket);
 }
@@ -473,6 +505,10 @@ fn get_metrics_config() -> Result<MetricsConfig, MetricsError> {
 }
 
 pub fn metrics_config_sanity_check(cluster_type: ClusterType) -> Result<(), MetricsError> {
+    if !export_enabled() {
+        // A config that will never be read cannot point at the wrong cluster.
+        return Ok(());
+    }
     let config = match get_metrics_config() {
         Ok(config) => config,
         Err(MetricsError::VarError(env::VarError::NotPresent)) => return Ok(()),
@@ -492,6 +528,11 @@ pub fn metrics_config_sanity_check(cluster_type: ClusterType) -> Result<(), Metr
 /// Blocks until all pending points from previous calls to `submit` have been
 /// transmitted.
 pub fn flush() {
+    if !export_enabled() {
+        // Nothing was ever queued, and building the agent here would start its thread and
+        // read the metrics config for no reason.
+        return;
+    }
     let agent = get_singleton_agent();
     agent.flush();
 }
@@ -738,5 +779,38 @@ mod test {
         let test_host_id = "test_host_123".to_string();
         set_host_id(test_host_id.clone());
         assert_eq!(get_host_id(), test_host_id);
+    }
+
+    /// With export off, a configured metrics host is never consulted: `submit` and `flush`
+    /// return before the singleton agent exists, and the cluster/db sanity check has nothing
+    /// to object to because the config will never be read.
+    #[test]
+    fn test_export_disabled_ignores_metrics_config() {
+        assert!(export_enabled(), "export defaults to on for library users");
+
+        // A config that the sanity check would normally reject: mainnet-beta database while
+        // running against devnet.
+        // SAFETY: single-threaded test setup; no other thread reads the environment here.
+        unsafe {
+            env::set_var(
+                "SOLANA_METRICS_CONFIG",
+                "host=http://127.0.0.1:1,db=mainnet-beta,u=u,p=p",
+            );
+        }
+        assert!(metrics_config_sanity_check(ClusterType::Devnet).is_err());
+
+        set_export_enabled(false);
+        assert!(!export_enabled());
+        assert!(metrics_config_sanity_check(ClusterType::Devnet).is_ok());
+
+        // Neither of these may reach the (unroutable) host above.
+        submit(DataPoint::new("must_not_be_exported"), Level::Info);
+        flush();
+
+        set_export_enabled(true);
+        // SAFETY: as above.
+        unsafe {
+            env::remove_var("SOLANA_METRICS_CONFIG");
+        }
     }
 }
