@@ -614,6 +614,18 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("dangerous_duplicate_slot_repair_bypass")
+            .hidden(hidden_unless_forced())
+            .long("dangerous-duplicate-slot-repair-bypass")
+            .help(
+                "Do not exit when a duplicate slot cannot be repaired after repeated attempts; \
+                 log and continue instead. That panic exists to stop a node that disagrees with \
+                 the cluster on a bank hash, so this is only for throwaway test clusters. The \
+                 validator refuses to start with this set on any genesis other than development \
+                 or devnet.",
+            ),
+    )
+    .arg(
         Arg::with_name("hard_forks")
             .long("hard-fork")
             .value_name("SLOT")

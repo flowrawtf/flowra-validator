@@ -923,6 +923,7 @@ pub fn execute(
         snapshot_config,
         no_wait_for_vote_to_start_leader: matches.is_present("no_wait_for_vote_to_start_leader"),
         wait_to_vote_slot: None,
+        duplicate_slot_repair_bypass: matches.is_present("dangerous_duplicate_slot_repair_bypass"),
         runtime_config: RuntimeConfig {
             log_messages_bytes_limit: value_of(matches, "log_messages_bytes_limit"),
             ..RuntimeConfig::default()

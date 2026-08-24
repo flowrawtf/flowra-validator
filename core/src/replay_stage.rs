@@ -51,6 +51,7 @@ use {
     rayon::{ThreadPool, prelude::*},
     solana_accounts_db::contains::Contains,
     solana_clock::{BankId, Slot},
+    solana_cluster_type::ClusterType,
     solana_geyser_plugin_manager::block_metadata_notifier_interface::BlockMetadataNotifierArc,
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
@@ -133,7 +134,6 @@ const ASYNC_VERIFICATION_FREELIST_CAPACITY: usize = 5;
 pub(crate) const MAX_VOTE_SIGNATURES: usize = 200;
 const MAX_VOTE_REFRESH_INTERVAL_MILLIS: usize = 5000;
 const MAX_REPAIR_RETRY_LOOP_ATTEMPTS: usize = 10;
-const DUPLICATE_SLOT_DEVNET_SKIP: bool = true; // devnet: skip panic on duplicate slot disagreement
 
 // Give at least 4 leaders the chance to pack our vote
 const REFRESH_VOTE_BLOCKHEIGHT: usize = 16;
@@ -428,6 +428,12 @@ pub struct ReplayStageConfig {
     pub banking_tracer: Arc<BankingTracer>,
     pub snapshot_controller: Option<Arc<SnapshotController>>,
     pub replay_highest_frozen: Arc<ReplayHighestFrozen>,
+    // Development-only. When a duplicate slot cannot be repaired after
+    // MAX_REPAIR_RETRY_LOOP_ATTEMPTS, upstream panics and the node exits. Set this to log and
+    // keep going instead, which is what we want on a throwaway test cluster and never on a
+    // cluster carrying value. Honoured only on Development and Devnet; see
+    // dump_then_repair_correct_slots.
+    pub duplicate_slot_repair_bypass: bool,
 }
 
 pub struct ReplaySenders {
@@ -749,6 +755,7 @@ impl ReplayStage {
             banking_tracer,
             snapshot_controller,
             replay_highest_frozen,
+            duplicate_slot_repair_bypass,
         } = config;
 
         let ReplaySenders {
@@ -1478,6 +1485,7 @@ impl ReplayStage {
                         &dumped_slots_sender,
                         &my_pubkey,
                         &leader_schedule_cache,
+                        duplicate_slot_repair_bypass,
                     );
                     dump_then_repair_correct_slots_time.stop();
 
@@ -2028,12 +2036,21 @@ impl ReplayStage {
         dumped_slots_sender: &DumpedSlotsSender,
         my_pubkey: &Pubkey,
         leader_schedule_cache: &LeaderScheduleCache,
+        duplicate_slot_repair_bypass: bool,
     ) {
         if duplicate_slots_to_repair.is_empty() {
             return;
         }
 
         let root_bank = bank_forks.read().unwrap().root_bank();
+        // Skipping the repair-loop panic is a deviation from consensus-critical upstream
+        // behaviour, so re-derive it from the root bank's own genesis rather than trusting
+        // whoever built the config. This is the last point before the panic would be skipped.
+        let repair_bypass = duplicate_slot_repair_bypass
+            && matches!(
+                root_bank.cluster_type(),
+                ClusterType::Development | ClusterType::Devnet
+            );
         let mut dumped = vec![];
         // TODO: handle if alternate version of descendant also got confirmed after ancestor was
         // confirmed, what happens then? Should probably keep track of dumped list and skip things
@@ -2122,23 +2139,25 @@ impl ReplayStage {
                         *e
                     }; // borrow dropped here
                     if attempt_no > MAX_REPAIR_RETRY_LOOP_ATTEMPTS {
-                        if DUPLICATE_SLOT_DEVNET_SKIP {
+                        if repair_bypass {
                             warn!(
-                                "[devnet] Duplicate slot {} repair exceeded {} attempts \
-                                 (correct_hash={}, our_hash={:?}). Resetting counter.",
-                                duplicate_slot, MAX_REPAIR_RETRY_LOOP_ATTEMPTS,
-                                correct_hash, frozen_hash
+                                "Duplicate slot {duplicate_slot} repair exceeded \
+                                 {MAX_REPAIR_RETRY_LOOP_ATTEMPTS} attempts (correct_hash \
+                                 {correct_hash}, our hash {frozen_hash:?}). Resetting the counter \
+                                 and continuing because \
+                                 --dangerous-duplicate-slot-repair-bypass is set on a \
+                                 development cluster; a real cluster would exit here"
                             );
                             purge_repair_slot_counter.remove(duplicate_slot);
-                            // Skip the panic — fall through to purge and continue
                         } else {
-                        panic!(
-                            "We have tried to repair duplicate slot: {duplicate_slot} more than \
-                             {MAX_REPAIR_RETRY_LOOP_ATTEMPTS} times and are unable to freeze a \
-                             block with bankhash {correct_hash}, instead we have a block with \
-                             bankhash {frozen_hash:?}. This is most likely a bug in the runtime. \
-                             At this point manual intervention is needed to make progress. Exiting"
-                        );
+                            panic!(
+                                "We have tried to repair duplicate slot: {duplicate_slot} more \
+                                 than {MAX_REPAIR_RETRY_LOOP_ATTEMPTS} times and are unable to \
+                                 freeze a block with bankhash {correct_hash}, instead we have a \
+                                 block with bankhash {frozen_hash:?}. This is most likely a bug \
+                                 in the runtime. At this point manual intervention is needed to \
+                                 make progress. Exiting"
+                            );
                         }
                     }
 
