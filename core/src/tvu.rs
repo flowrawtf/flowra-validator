@@ -154,6 +154,8 @@ pub struct TvuConfig {
     pub bls_sigverify_threads: NonZeroUsize,
     pub turbine_xdp_sender: Option<TurbineXdpSender>,
     pub repair_xdp_sender: Option<PinnedXdpSender>,
+    // Development-only; see ReplayStageConfig::duplicate_slot_repair_bypass.
+    pub duplicate_slot_repair_bypass: bool,
 }
 
 impl Default for TvuConfig {
@@ -170,6 +172,7 @@ impl Default for TvuConfig {
             bls_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             turbine_xdp_sender: None,
             repair_xdp_sender: None,
+            duplicate_slot_repair_bypass: false,
         }
     }
 }
@@ -598,6 +601,7 @@ impl Tvu {
             banking_tracer,
             snapshot_controller,
             replay_highest_frozen,
+            duplicate_slot_repair_bypass: tvu_config.duplicate_slot_repair_bypass,
         };
 
         let voting_service = VotingService::new(

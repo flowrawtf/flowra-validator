@@ -58,6 +58,7 @@ use {
     },
     solana_client::connection_cache::{ConnectionCache, Protocol},
     solana_clock::Slot,
+    solana_cluster_type::ClusterType,
     solana_entry::poh::compute_hash_time,
     solana_epoch_schedule::MAX_LEADER_SCHEDULE_EPOCH_OFFSET,
     solana_genesis_config::GenesisConfig,
@@ -384,6 +385,9 @@ pub struct ValidatorConfig {
     pub validator_exit_backpressure: HashMap<String, Arc<AtomicBool>>,
     pub no_wait_for_vote_to_start_leader: bool,
     pub wait_to_vote_slot: Option<Slot>,
+    // Development-only; see ReplayStageConfig::duplicate_slot_repair_bypass. Validator::new
+    // refuses to start with this set on anything but a Development or Devnet genesis.
+    pub duplicate_slot_repair_bypass: bool,
     pub runtime_config: RuntimeConfig,
     pub banking_trace_dir_byte_limit: banking_trace::DirByteLimit,
     pub block_verification_method: BlockVerificationMethod,
@@ -483,6 +487,7 @@ impl ValidatorConfig {
             no_wait_for_vote_to_start_leader: true,
             accounts_db_config: ACCOUNTS_DB_CONFIG_FOR_TESTING,
             wait_to_vote_slot: None,
+            duplicate_slot_repair_bypass: false,
             runtime_config: RuntimeConfig::default(),
             banking_trace_dir_byte_limit: 0,
             block_verification_method: BlockVerificationMethod::default(),
@@ -873,6 +878,20 @@ impl Validator {
         }
         let genesis_config = load_genesis(config, ledger_path)?;
         metrics_config_sanity_check(genesis_config.cluster_type)?;
+
+        if config.duplicate_slot_repair_bypass
+            && !matches!(
+                genesis_config.cluster_type,
+                ClusterType::Development | ClusterType::Devnet
+            )
+        {
+            return Err(anyhow!(
+                "--dangerous-duplicate-slot-repair-bypass suppresses a panic that exists to stop \
+                 a node that disagrees with the cluster on a bank hash. It is only accepted on a \
+                 development or devnet genesis, not on {:?}",
+                genesis_config.cluster_type
+            ));
+        }
 
         info!("Validating accounts paths...");
         *start_progress.write().unwrap() = ValidatorStartProgress::CleaningAccounts;
@@ -1712,6 +1731,7 @@ impl Validator {
                 bls_sigverify_threads: config.tvu_bls_sigverify_threads,
                 turbine_xdp_sender: turbine_xdp_sender.clone(),
                 repair_xdp_sender,
+                duplicate_slot_repair_bypass: config.duplicate_slot_repair_bypass,
             },
             &max_slots,
             block_metadata_notifier,

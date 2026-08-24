@@ -65,6 +65,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         no_wait_for_vote_to_start_leader: config.no_wait_for_vote_to_start_leader,
         accounts_db_config: config.accounts_db_config.clone(),
         wait_to_vote_slot: config.wait_to_vote_slot,
+        duplicate_slot_repair_bypass: config.duplicate_slot_repair_bypass,
         runtime_config: config.runtime_config.clone(),
         banking_trace_dir_byte_limit: config.banking_trace_dir_byte_limit,
         block_verification_method: config.block_verification_method.clone(),
