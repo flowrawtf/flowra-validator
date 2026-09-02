@@ -349,8 +349,12 @@ where
             }
 
             self.receive_completed(&decision)?;
-            let scheduled = self.process_transactions(&decision, cost_pacer.as_ref(), &now)?;
-            if scheduled == 0 {
+            let _scheduled = self.process_transactions(&decision, cost_pacer.as_ref(), &now)?;
+            // Only recheck the buffer when not leader: a leader-slot pass that schedules
+            // nothing (all threads over quota, or everything conflicting) would otherwise
+            // spend the slot running status-cache lookups instead of retrying scheduling.
+            // Upstream #13721.
+            if decision.bank().is_none() {
                 let (_, clean_time_us) = measure_us!(self.incremental_recheck());
                 self.timing_metrics.update(|timing_metrics| {
                     timing_metrics.clean_time_us += clean_time_us;
