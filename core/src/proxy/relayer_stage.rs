@@ -437,10 +437,7 @@ impl RelayerStage {
                     info!("pushed PBP policy to relayer from {path:?}, digest {digest}");
                     *last_mtime = mtime;
                 }
-                datapoint_info!(
-                    "relayer_stage-pbp_policy",
-                    ("digest", digest, String),
-                );
+                datapoint_info!("relayer_stage-pbp_policy", ("digest", digest, String),);
             }
             Ok(Err(status)) => warn!("relayer provide_pbp_policy failed: {status}"),
             Err(_) => warn!("relayer provide_pbp_policy timed out"),
