@@ -14,7 +14,7 @@ use {
         bundle_stage::{
             bundle_account_locker::BundleAccountLocker,
             bundle_consumer::BundleConsumer,
-            bundle_storage::{BundleStorage, BundleStorageEntry, BundleStorageError},
+            bundle_storage::{BundleStorage, BundleStorageEntry, BundleStorageError, PruneStats},
         },
         packet_bundle::VerifiedPacketBundle,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
@@ -103,6 +103,11 @@ pub struct BundleStageLoopMetrics {
     num_bundles_cleared_on_forward: Saturating<u64>,
     num_bundles_error_retryable: Saturating<u64>,
     num_bundles_error_non_retryable: Saturating<u64>,
+
+    // Bundles dropped at leader-slot entry by `BundleStorage::prune_stale`, before any lock or
+    // load was spent on them.
+    num_bundles_pruned_stale_blockhash: Saturating<u64>,
+    num_bundles_pruned_already_processed: Saturating<u64>,
 }
 
 impl Default for BundleStageLoopMetrics {
@@ -134,6 +139,8 @@ impl Default for BundleStageLoopMetrics {
             num_bundles_cleared_on_forward: Saturating(0),
             num_bundles_error_retryable: Saturating(0),
             num_bundles_error_non_retryable: Saturating(0),
+            num_bundles_pruned_stale_blockhash: Saturating(0),
+            num_bundles_pruned_already_processed: Saturating(0),
         }
     }
 }
@@ -197,6 +204,11 @@ impl BundleStageLoopMetrics {
 
     pub fn increment_bundle_error_non_retryable(&mut self) {
         self.num_bundles_error_non_retryable += 1;
+    }
+
+    pub fn increment_bundles_pruned(&mut self, stats: PruneStats) {
+        self.num_bundles_pruned_stale_blockhash += stats.stale_blockhash;
+        self.num_bundles_pruned_already_processed += stats.already_processed;
     }
 
     pub fn increment_bundle_dropped_error(&mut self, error: BundleStorageError) {
@@ -332,6 +344,16 @@ impl BundleStageLoopMetrics {
                     self.num_bundles_error_non_retryable.0 as i64,
                     i64
                 ),
+                (
+                    "num_bundles_pruned_stale_blockhash",
+                    self.num_bundles_pruned_stale_blockhash.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_pruned_already_processed",
+                    self.num_bundles_pruned_already_processed.0 as i64,
+                    i64
+                ),
             );
 
             self.last_report = Instant::now();
@@ -364,10 +386,14 @@ impl BundleStageLoopMetrics {
         self.num_bundles_cleared_on_forward = Saturating(0);
         self.num_bundles_error_retryable = Saturating(0);
         self.num_bundles_error_non_retryable = Saturating(0);
+        self.num_bundles_pruned_stale_blockhash = Saturating(0);
+        self.num_bundles_pruned_already_processed = Saturating(0);
     }
 
     pub fn has_data(&self) -> bool {
         self.num_bundles_received.0 > 0
+            || self.num_bundles_pruned_stale_blockhash.0 > 0
+            || self.num_bundles_pruned_already_processed.0 > 0
             || self.num_packets_received.0 > 0
             || self.newly_buffered_bundles_count.0 > 0
             || self.current_buffered_bundles_count.0 > 0
@@ -728,6 +754,9 @@ impl BundleStage {
 
             *last_tip_update_slot = bank.slot();
         }
+
+        // Clear out what this bank would reject anyway, so the window opens on live bundles.
+        bundle_stage_metrics.increment_bundles_pruned(bundle_storage.prune_stale(bank));
 
         // This loop shall:
         // - Pop a bundle from the bundle storage

@@ -20,8 +20,18 @@ use {
     solana_runtime_transaction::{
         sanitize_config::sanitize_config, transaction_meta::TransactionMeta,
     },
+    solana_svm::transaction_error_metrics::TransactionErrorMetrics,
+    solana_transaction::TransactionError,
     std::collections::VecDeque,
 };
+
+/// Bundles removed by [`BundleStorage::prune_stale`], by the reason the working bank would
+/// have rejected them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    pub stale_blockhash: u64,
+    pub already_processed: u64,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum BundleStorageError {
@@ -57,6 +67,8 @@ pub struct BundleStorage {
     // Storage for bundles that exceeded the cost model for the slot they were last attempted
     // execution on
     cost_model_buffered_bundles: VecDeque<BundleTransactionId>,
+    /// The bank the buffer was last pruned against; pruning runs once per leader bank.
+    last_pruned_bank: Option<(Slot, BankId)>,
 }
 
 impl BundleStorage {
@@ -72,7 +84,85 @@ impl BundleStorage {
             ),
             unprocessed_bundles: VecDeque::with_capacity(transaction_capacity),
             cost_model_buffered_bundles: VecDeque::with_capacity(transaction_capacity),
+            last_pruned_bank: None,
         }
+    }
+
+    /// Drop buffered bundles that `bank` would reject before execution: an expired (or
+    /// unknown) blockhash, or a signature already in the status cache.
+    ///
+    /// Bundles received before a leader window sit in the buffer until the first slot opens,
+    /// and on mainnet a large share of them are dead by then — the same transaction landed in
+    /// an earlier leader's block, or its blockhash aged out while it waited. Executing each of
+    /// those costs a lock round-trip and a load before it fails, and every one of them runs
+    /// ahead of a live bundle in FIFO order. This applies the same age and status-cache checks
+    /// the bank runs at execution, once per leader bank, over the whole buffer, so the window
+    /// opens on bundles that can still land.
+    ///
+    /// Only these two verdicts prune. Anything else the checks report is left for execution
+    /// to classify, since it may depend on state that changes within the slot. Runs once per
+    /// `(slot, bank_id)`; a second call for the same bank returns zeros.
+    pub fn prune_stale(&mut self, bank: &Bank) -> PruneStats {
+        let bank_key = (bank.slot(), bank.bank_id());
+        if self.last_pruned_bank == Some(bank_key) {
+            return PruneStats::default();
+        }
+        self.last_pruned_bank = Some(bank_key);
+
+        let mut stats = PruneStats::default();
+        let mut error_counters = TransactionErrorMetrics::default();
+        let max_age = bank.max_processing_age();
+        let container = &mut self.transaction_view_state_container;
+
+        for queue in [
+            &mut self.unprocessed_bundles,
+            &mut self.cost_model_buffered_bundles,
+        ] {
+            let mut kept = VecDeque::with_capacity(queue.len());
+            while let Some(bundle) = queue.pop_front() {
+                let verdict = {
+                    let transactions: SmallVec<[&RuntimeTransactionView; 5]> = bundle
+                        .container_ids
+                        .iter()
+                        .map(|id| {
+                            container
+                                .get_transaction(*id)
+                                .expect("transaction must exist")
+                        })
+                        .collect();
+                    let lock_results: SmallVec<[Result<(), TransactionError>; 5]> =
+                        SmallVec::from_elem(Ok(()), transactions.len());
+                    bank.check_transactions::<RuntimeTransactionView>(
+                        &transactions,
+                        &lock_results,
+                        max_age,
+                        true,
+                        &mut error_counters,
+                    )
+                    .into_iter()
+                    .find_map(|result| result.err())
+                };
+
+                match verdict {
+                    Some(TransactionError::BlockhashNotFound) => {
+                        stats.stale_blockhash += 1;
+                    }
+                    Some(TransactionError::AlreadyProcessed) => {
+                        stats.already_processed += 1;
+                    }
+                    _ => {
+                        kept.push_back(bundle);
+                        continue;
+                    }
+                }
+                for container_id in bundle.container_ids {
+                    container.remove_by_id(container_id);
+                }
+            }
+            *queue = kept;
+        }
+
+        stats
     }
 
     pub fn unprocessed_bundles_len(&self) -> usize {
@@ -304,7 +394,7 @@ mod tests {
                 receive_and_buffer::PacketHandlingError,
                 transaction_state_container::StateContainer,
             },
-            bundle_stage::bundle_storage::{BundleStorage, BundleStorageError},
+            bundle_stage::bundle_storage::{BundleStorage, BundleStorageError, PruneStats},
             packet_bundle::VerifiedPacketBundle,
         },
         ahash::{HashSet, HashSetExt},
@@ -313,7 +403,7 @@ mod tests {
             self as address_lookup_table,
             state::{AddressLookupTable, LookupTableMeta},
         },
-        solana_genesis_config::GenesisConfig,
+        solana_genesis_config::{GenesisConfig, create_genesis_config},
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_leader_schedule::SlotLeader,
@@ -326,6 +416,135 @@ mod tests {
         solana_transaction::{Transaction, versioned::VersionedTransaction},
         std::borrow::Cow,
     };
+
+    fn bundle_of(transaction: Transaction) -> VerifiedPacketBundle {
+        VerifiedPacketBundle::new(PacketBatch::from(vec![
+            BytesPacket::from_data(transaction).unwrap(),
+        ]))
+    }
+
+    #[test]
+    fn test_prune_stale_drops_expired_blockhash_and_keeps_live() {
+        let (genesis_config, mint_keypair) = create_genesis_config(10_000_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let recipient = Pubkey::new_unique();
+        let live = solana_system_transaction::transfer(
+            &mint_keypair,
+            &recipient,
+            1,
+            bank.last_blockhash(),
+        );
+        // A blockhash the bank has never seen: dead on arrival.
+        let dead =
+            solana_system_transaction::transfer(&mint_keypair, &recipient, 2, Hash::new_unique());
+
+        let mut bundle_storage = BundleStorage::with_capacity(4);
+        let blacklist = HashSet::new();
+        assert!(
+            bundle_storage
+                .insert_bundle(bundle_of(dead), &bank, &bank, &blacklist)
+                .is_ok()
+        );
+        assert!(
+            bundle_storage
+                .insert_bundle(bundle_of(live), &bank, &bank, &blacklist)
+                .is_ok()
+        );
+        assert_eq!(bundle_storage.unprocessed_bundles_len(), 2);
+        assert_eq!(bundle_storage.num_packets_buffered(), 2);
+
+        assert_eq!(
+            bundle_storage.prune_stale(&bank),
+            PruneStats {
+                stale_blockhash: 1,
+                already_processed: 0
+            }
+        );
+        assert_eq!(bundle_storage.unprocessed_bundles_len(), 1);
+        assert_eq!(bundle_storage.num_packets_buffered(), 1);
+
+        // The survivor is the live one, and it is still poppable.
+        let popped = bundle_storage
+            .pop_bundle(bank.slot(), bank.bank_id())
+            .unwrap();
+        assert_eq!(popped.transactions.len(), 1);
+        assert_eq!(
+            *popped.transactions[0].recent_blockhash(),
+            bank.last_blockhash()
+        );
+        bundle_storage.destroy_bundle(popped);
+
+        // Same bank again: nothing to do.
+        assert_eq!(bundle_storage.prune_stale(&bank), PruneStats::default());
+    }
+
+    #[test]
+    fn test_prune_stale_drops_already_processed() {
+        let (genesis_config, mint_keypair) = create_genesis_config(10_000_000);
+        // Executing a transaction needs the program cache's fork graph, which only the
+        // bank-forks constructor wires up.
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let recipient = Pubkey::new_unique();
+        let transaction = solana_system_transaction::transfer(
+            &mint_keypair,
+            &recipient,
+            bank.get_minimum_balance_for_rent_exemption(0),
+            bank.last_blockhash(),
+        );
+        // Land it first, so its signature is in the status cache.
+        bank.process_transaction(&transaction).unwrap();
+
+        let mut bundle_storage = BundleStorage::with_capacity(4);
+        let blacklist = HashSet::new();
+        assert!(
+            bundle_storage
+                .insert_bundle(bundle_of(transaction), &bank, &bank, &blacklist)
+                .is_ok()
+        );
+
+        assert_eq!(
+            bundle_storage.prune_stale(&bank),
+            PruneStats {
+                stale_blockhash: 0,
+                already_processed: 1
+            }
+        );
+        assert_eq!(bundle_storage.unprocessed_bundles_len(), 0);
+        assert_eq!(bundle_storage.num_packets_buffered(), 0);
+    }
+
+    #[test]
+    fn test_prune_stale_covers_cost_model_retry_queue() {
+        let (genesis_config, mint_keypair) = create_genesis_config(10_000_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let recipient = Pubkey::new_unique();
+        let dead =
+            solana_system_transaction::transfer(&mint_keypair, &recipient, 2, Hash::new_unique());
+
+        let mut bundle_storage = BundleStorage::with_capacity(4);
+        let blacklist = HashSet::new();
+        assert!(
+            bundle_storage
+                .insert_bundle(bundle_of(dead), &bank, &bank, &blacklist)
+                .is_ok()
+        );
+        // Pop it and push it back through the cost-model retry path.
+        let popped = bundle_storage
+            .pop_bundle(bank.slot(), bank.bank_id())
+            .unwrap();
+        bundle_storage.retry_bundle(popped);
+        assert_eq!(bundle_storage.cost_model_buffered_bundles_len(), 1);
+
+        assert_eq!(
+            bundle_storage.prune_stale(&bank),
+            PruneStats {
+                stale_blockhash: 1,
+                already_processed: 0
+            }
+        );
+        assert_eq!(bundle_storage.cost_model_buffered_bundles_len(), 0);
+        assert_eq!(bundle_storage.num_packets_buffered(), 0);
+    }
 
     pub fn test_tx() -> Transaction {
         let keypair1 = Keypair::new();
