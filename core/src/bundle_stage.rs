@@ -10,6 +10,7 @@ use {
             consumer::ProcessTransactionBatchOutput,
             decision_maker::{BufferedPacketsDecision, DecisionMaker},
             scheduler_messages::MaxAge,
+            transaction_scheduler::receive_and_buffer::PacketHandlingError,
         },
         bundle_stage::{
             bundle_account_locker::BundleAccountLocker,
@@ -35,6 +36,7 @@ use {
         bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
         vote_sender_types::ReplayVoteSender,
     },
+    solana_signature::{SIGNATURE_BYTES, Signature},
     solana_transaction::TransactionError,
     std::{
         collections::VecDeque,
@@ -108,6 +110,22 @@ pub struct BundleStageLoopMetrics {
     // load was spent on them.
     num_bundles_pruned_stale_blockhash: Saturating<u64>,
     num_bundles_pruned_already_processed: Saturating<u64>,
+
+    // `num_bundles_dropped_packet_filter_error` split by which check failed. A searcher whose
+    // bundles all die at the filter is indistinguishable from any other drop without this.
+    num_bundles_dropped_pf_sanitization: Saturating<u64>,
+    num_bundles_dropped_pf_lock_validation: Saturating<u64>,
+    num_bundles_dropped_pf_compute_budget: Saturating<u64>,
+    num_bundles_dropped_pf_alt_resolution: Saturating<u64>,
+    num_bundles_dropped_pf_filter_key: Saturating<u64>,
+
+    // Which cost-model limit a bundle tripped. The bundle QoS path returns empty
+    // `TransactionErrorMetrics` on rejection, so these never reach the worker error metrics;
+    // this is the only place the limit is named.
+    num_bundles_cost_model_block_limit: Saturating<u64>,
+    num_bundles_cost_model_account_limit: Saturating<u64>,
+    num_bundles_cost_model_data_limit: Saturating<u64>,
+    num_bundles_cost_model_other: Saturating<u64>,
 }
 
 impl Default for BundleStageLoopMetrics {
@@ -141,6 +159,15 @@ impl Default for BundleStageLoopMetrics {
             num_bundles_error_non_retryable: Saturating(0),
             num_bundles_pruned_stale_blockhash: Saturating(0),
             num_bundles_pruned_already_processed: Saturating(0),
+            num_bundles_dropped_pf_sanitization: Saturating(0),
+            num_bundles_dropped_pf_lock_validation: Saturating(0),
+            num_bundles_dropped_pf_compute_budget: Saturating(0),
+            num_bundles_dropped_pf_alt_resolution: Saturating(0),
+            num_bundles_dropped_pf_filter_key: Saturating(0),
+            num_bundles_cost_model_block_limit: Saturating(0),
+            num_bundles_cost_model_account_limit: Saturating(0),
+            num_bundles_cost_model_data_limit: Saturating(0),
+            num_bundles_cost_model_other: Saturating(0),
         }
     }
 }
@@ -211,6 +238,40 @@ impl BundleStageLoopMetrics {
         self.num_bundles_pruned_already_processed += stats.already_processed;
     }
 
+    /// Name the limit when the cost model refused a bundle. `BundleConsumer` marks the
+    /// offending transaction `NotCommitted(<limit error>)` and the rest `CommitCancelled`.
+    pub fn record_cost_model_reject(&mut self, output: &ProcessTransactionBatchOutput) {
+        if output.cost_model_throttled_transactions_count == 0 {
+            return;
+        }
+        let reason = output
+            .execute_and_commit_transactions_output
+            .commit_transactions_result
+            .as_ref()
+            .ok()
+            .and_then(|results| {
+                results.iter().find_map(|r| match r {
+                    CommitTransactionDetails::NotCommitted(TransactionError::CommitCancelled) => {
+                        None
+                    }
+                    CommitTransactionDetails::NotCommitted(err) => Some(err),
+                    _ => None,
+                })
+            });
+        match reason {
+            Some(TransactionError::WouldExceedMaxBlockCostLimit) => {
+                self.num_bundles_cost_model_block_limit += 1
+            }
+            Some(TransactionError::WouldExceedMaxAccountCostLimit) => {
+                self.num_bundles_cost_model_account_limit += 1
+            }
+            Some(TransactionError::WouldExceedAccountDataBlockLimit) => {
+                self.num_bundles_cost_model_data_limit += 1
+            }
+            _ => self.num_bundles_cost_model_other += 1,
+        }
+    }
+
     pub fn increment_bundle_dropped_error(&mut self, error: BundleStorageError) {
         self.num_bundles_dropped += 1;
         match error {
@@ -223,8 +284,23 @@ impl BundleStageLoopMetrics {
             BundleStorageError::PacketMarkedDiscard(_) => {
                 self.num_bundles_dropped_packet_marked_discard += 1;
             }
-            BundleStorageError::PacketFilterError(_) => {
+            BundleStorageError::PacketFilterError((err, _)) => {
                 self.num_bundles_dropped_packet_filter_error += 1;
+                match err {
+                    PacketHandlingError::Sanitization => {
+                        self.num_bundles_dropped_pf_sanitization += 1
+                    }
+                    PacketHandlingError::LockValidation => {
+                        self.num_bundles_dropped_pf_lock_validation += 1
+                    }
+                    PacketHandlingError::ComputeBudget => {
+                        self.num_bundles_dropped_pf_compute_budget += 1
+                    }
+                    PacketHandlingError::ALTResolution => {
+                        self.num_bundles_dropped_pf_alt_resolution += 1
+                    }
+                    PacketHandlingError::FilterKey => self.num_bundles_dropped_pf_filter_key += 1,
+                }
             }
             BundleStorageError::BundleTooLarge => {
                 self.num_bundles_dropped_bundle_too_large += 1;
@@ -354,6 +430,51 @@ impl BundleStageLoopMetrics {
                     self.num_bundles_pruned_already_processed.0 as i64,
                     i64
                 ),
+                (
+                    "num_bundles_dropped_pf_sanitization",
+                    self.num_bundles_dropped_pf_sanitization.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_dropped_pf_lock_validation",
+                    self.num_bundles_dropped_pf_lock_validation.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_dropped_pf_compute_budget",
+                    self.num_bundles_dropped_pf_compute_budget.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_dropped_pf_alt_resolution",
+                    self.num_bundles_dropped_pf_alt_resolution.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_dropped_pf_filter_key",
+                    self.num_bundles_dropped_pf_filter_key.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_cost_model_block_limit",
+                    self.num_bundles_cost_model_block_limit.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_cost_model_account_limit",
+                    self.num_bundles_cost_model_account_limit.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_cost_model_data_limit",
+                    self.num_bundles_cost_model_data_limit.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_cost_model_other",
+                    self.num_bundles_cost_model_other.0 as i64,
+                    i64
+                ),
             );
 
             self.last_report = Instant::now();
@@ -388,12 +509,25 @@ impl BundleStageLoopMetrics {
         self.num_bundles_error_non_retryable = Saturating(0);
         self.num_bundles_pruned_stale_blockhash = Saturating(0);
         self.num_bundles_pruned_already_processed = Saturating(0);
+        self.num_bundles_dropped_pf_sanitization = Saturating(0);
+        self.num_bundles_dropped_pf_lock_validation = Saturating(0);
+        self.num_bundles_dropped_pf_compute_budget = Saturating(0);
+        self.num_bundles_dropped_pf_alt_resolution = Saturating(0);
+        self.num_bundles_dropped_pf_filter_key = Saturating(0);
+        self.num_bundles_cost_model_block_limit = Saturating(0);
+        self.num_bundles_cost_model_account_limit = Saturating(0);
+        self.num_bundles_cost_model_data_limit = Saturating(0);
+        self.num_bundles_cost_model_other = Saturating(0);
     }
 
     pub fn has_data(&self) -> bool {
         self.num_bundles_received.0 > 0
             || self.num_bundles_pruned_stale_blockhash.0 > 0
             || self.num_bundles_pruned_already_processed.0 > 0
+            || self.num_bundles_cost_model_block_limit.0 > 0
+            || self.num_bundles_cost_model_account_limit.0 > 0
+            || self.num_bundles_cost_model_data_limit.0 > 0
+            || self.num_bundles_cost_model_other.0 > 0
             || self.num_packets_received.0 > 0
             || self.newly_buffered_bundles_count.0 > 0
             || self.current_buffered_bundles_count.0 > 0
@@ -646,6 +780,12 @@ impl BundleStage {
             bundle_stage_metrics.increment_num_bundles_received(1);
             bundle_stage_metrics.increment_num_packets_received(num_packets as u64);
 
+            // The bundle is consumed by the insert, so read the leading signature now; it is
+            // only needed to name a dropped bundle in the debug log.
+            let first_signature = log::log_enabled!(log::Level::Debug)
+                .then(|| Self::first_signature(&bundle))
+                .flatten();
+
             match bundle_storage.insert_bundle(
                 bundle,
                 &root_bank,
@@ -656,12 +796,26 @@ impl BundleStage {
                     bundle_stage_metrics.increment_newly_buffered_bundles_count(1);
                 }
                 Err(e) => {
+                    if let BundleStorageError::PacketFilterError((err, idx)) = &e {
+                        debug!(
+                            "bundle dropped by packet filter: {err:?} at packet {idx}, first \
+                             signature {first_signature:?}"
+                        );
+                    }
                     bundle_stage_metrics.increment_bundle_dropped_error(e);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// The first signature of the bundle's first packet, read straight off the wire bytes
+    /// (1-byte signature count, then the signatures). `None` if the packet is too short.
+    fn first_signature(bundle: &VerifiedPacketBundle) -> Option<Signature> {
+        let packet = bundle.batch().iter().next()?;
+        let bytes = packet.data(1..1 + SIGNATURE_BYTES)?;
+        Signature::try_from(bytes).ok()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -795,7 +949,13 @@ impl BundleStage {
             let Some(bundle) = bundles.pop_front() else {
                 break;
             };
-            let result = Self::process_bundle(bank, &bundle, consumer, consume_worker_metrics);
+            let result = Self::process_bundle(
+                bank,
+                &bundle,
+                consumer,
+                consume_worker_metrics,
+                bundle_stage_metrics,
+            );
             let _ = bundle_account_locker.unlock_bundle(&bundle.transactions, bank);
             match result {
                 Ok(output) => {
@@ -1021,6 +1181,7 @@ impl BundleStage {
         bundle: &BundleStorageEntry,
         consumer: &mut BundleConsumer,
         consume_worker_metrics: &ConsumeWorkerMetrics,
+        bundle_stage_metrics: &mut BundleStageLoopMetrics,
     ) -> BundleExecutionResult<ProcessTransactionBatchOutput> {
         if bank.is_complete() {
             return Err(BundleExecutionError::ErrorRetryable);
@@ -1034,6 +1195,7 @@ impl BundleStage {
         );
 
         consume_worker_metrics.update_for_consume(&output);
+        bundle_stage_metrics.record_cost_model_reject(&output);
 
         let result = Self::to_bundle_result(&output);
 
@@ -1069,6 +1231,13 @@ mod tests {
             tip_distribution::{JitoTipDistributionConfig, TipDistributionAccount},
             tip_payment::JitoTipPaymentConfig,
         },
+        crate::{
+            banking_stage::{
+                consumer::{ExecuteAndCommitTransactionsOutput, LeaderProcessedTransactionCounts},
+                leader_slot_timing_metrics::LeaderExecuteAndCommitTimings,
+            },
+            bundle_stage::bundle_storage::BundleStorageError,
+        },
         agave_feature_set::FeatureSet,
         crossbeam_channel::{bounded, unbounded},
         solana_cluster_type::ClusterType,
@@ -1093,6 +1262,7 @@ mod tests {
         solana_rent::Rent,
         solana_runtime::genesis_utils::create_genesis_config_with_leader_ex,
         solana_signer::Signer,
+        solana_svm::transaction_error_metrics::TransactionErrorMetrics,
         solana_system_transaction::transfer,
         solana_time_utils::timestamp,
         solana_vote_interface::state::vote_state_v4::VoteStateV4,
@@ -1140,6 +1310,111 @@ mod tests {
             },
             leader_keypair,
         }
+    }
+
+    fn cost_model_output(
+        results: Vec<CommitTransactionDetails>,
+        throttled: u64,
+    ) -> ProcessTransactionBatchOutput {
+        ProcessTransactionBatchOutput {
+            cost_model_throttled_transactions_count: throttled,
+            cost_model_us: 0,
+            execute_and_commit_transactions_output: ExecuteAndCommitTransactionsOutput {
+                transaction_counts: LeaderProcessedTransactionCounts::default(),
+                retryable_transaction_indexes: vec![],
+                commit_transactions_result: Ok(results),
+                execute_and_commit_timings: LeaderExecuteAndCommitTimings::default(),
+                error_counters: TransactionErrorMetrics::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_packet_filter_drops_are_counted_by_variant() {
+        let mut metrics = BundleStageLoopMetrics::default();
+        for (err, idx) in [
+            (PacketHandlingError::Sanitization, 0),
+            (PacketHandlingError::FilterKey, 1),
+            (PacketHandlingError::FilterKey, 2),
+        ] {
+            metrics
+                .increment_bundle_dropped_error(BundleStorageError::PacketFilterError((err, idx)));
+        }
+        assert_eq!(metrics.num_bundles_dropped.0, 3);
+        assert_eq!(metrics.num_bundles_dropped_packet_filter_error.0, 3);
+        assert_eq!(metrics.num_bundles_dropped_pf_sanitization.0, 1);
+        assert_eq!(metrics.num_bundles_dropped_pf_filter_key.0, 2);
+        assert_eq!(metrics.num_bundles_dropped_pf_lock_validation.0, 0);
+        assert_eq!(metrics.num_bundles_dropped_pf_compute_budget.0, 0);
+        assert_eq!(metrics.num_bundles_dropped_pf_alt_resolution.0, 0);
+    }
+
+    #[test]
+    fn test_cost_model_reject_names_the_limit() {
+        let mut metrics = BundleStageLoopMetrics::default();
+
+        // Not throttled: nothing is recorded, whatever the commit results say.
+        metrics.record_cost_model_reject(&cost_model_output(
+            vec![CommitTransactionDetails::NotCommitted(
+                TransactionError::WouldExceedMaxBlockCostLimit,
+            )],
+            0,
+        ));
+        assert_eq!(metrics.num_bundles_cost_model_block_limit.0, 0);
+
+        // The offending transaction is named; the rest of the bundle is CommitCancelled.
+        metrics.record_cost_model_reject(&cost_model_output(
+            vec![
+                CommitTransactionDetails::NotCommitted(TransactionError::CommitCancelled),
+                CommitTransactionDetails::NotCommitted(
+                    TransactionError::WouldExceedMaxAccountCostLimit,
+                ),
+                CommitTransactionDetails::NotCommitted(TransactionError::CommitCancelled),
+            ],
+            3,
+        ));
+        assert_eq!(metrics.num_bundles_cost_model_account_limit.0, 1);
+
+        metrics.record_cost_model_reject(&cost_model_output(
+            vec![CommitTransactionDetails::NotCommitted(
+                TransactionError::WouldExceedMaxBlockCostLimit,
+            )],
+            1,
+        ));
+        assert_eq!(metrics.num_bundles_cost_model_block_limit.0, 1);
+
+        metrics.record_cost_model_reject(&cost_model_output(
+            vec![CommitTransactionDetails::NotCommitted(
+                TransactionError::WouldExceedAccountDataBlockLimit,
+            )],
+            1,
+        ));
+        assert_eq!(metrics.num_bundles_cost_model_data_limit.0, 1);
+
+        // Throttled with no named limit in the results: counted, not lost.
+        metrics.record_cost_model_reject(&cost_model_output(
+            vec![CommitTransactionDetails::NotCommitted(
+                TransactionError::CommitCancelled,
+            )],
+            1,
+        ));
+        assert_eq!(metrics.num_bundles_cost_model_other.0, 1);
+        assert_eq!(metrics.num_bundles_cost_model_block_limit.0, 1);
+        assert_eq!(metrics.num_bundles_cost_model_account_limit.0, 1);
+    }
+
+    #[test]
+    fn test_first_signature_reads_the_wire_bytes() {
+        let tx = test_tx();
+        let packet = BytesPacket::from_data(tx.clone()).unwrap();
+        let bundle = VerifiedPacketBundle::new(PacketBatch::from(vec![packet]));
+        assert_eq!(
+            BundleStage::first_signature(&bundle),
+            Some(tx.signatures[0])
+        );
+
+        let empty = VerifiedPacketBundle::new(PacketBatch::from(vec![]));
+        assert_eq!(BundleStage::first_signature(&empty), None);
     }
 
     #[test]
