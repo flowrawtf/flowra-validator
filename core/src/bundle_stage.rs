@@ -15,7 +15,9 @@ use {
         bundle_stage::{
             bundle_account_locker::BundleAccountLocker,
             bundle_consumer::BundleConsumer,
-            bundle_storage::{BundleStorage, BundleStorageEntry, BundleStorageError, PruneStats},
+            bundle_storage::{
+                BundleOrdering, BundleStorage, BundleStorageEntry, BundleStorageError, PruneStats,
+            },
         },
         packet_bundle::VerifiedPacketBundle,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
@@ -672,7 +674,10 @@ impl BundleStage {
         cluster_info: Arc<ClusterInfo>,
     ) {
         let mut last_metrics_update = Instant::now();
-        let mut bundle_storage = BundleStorage::with_capacity(2_000);
+        let ordering = BundleOrdering::from_env();
+        info!("bundle stage ordering: {ordering:?}");
+        let mut bundle_storage =
+            BundleStorage::with_ordering(2_000, ordering, tip_managers.get_tip_accounts().clone());
 
         let mut bundle_stage_metrics = BundleStageLoopMetrics::default();
         let consume_worker_metrics = ConsumeWorkerMetrics::new(10_000);

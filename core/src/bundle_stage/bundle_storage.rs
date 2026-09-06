@@ -10,6 +10,7 @@ use {
             },
         },
         packet_bundle::VerifiedPacketBundle,
+        transaction_priority::transaction_tip_lamports,
     },
     ahash::HashSet,
     arrayvec::ArrayVec,
@@ -22,8 +23,35 @@ use {
     },
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     solana_transaction::TransactionError,
-    std::collections::VecDeque,
+    std::{
+        cmp::Ordering,
+        collections::{BinaryHeap, VecDeque},
+    },
 };
+
+/// The order buffered bundles are handed to execution in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleOrdering {
+    /// Arrival order. What Jito ships.
+    Fifo,
+    /// Highest tip first; equal tips in arrival order.
+    ///
+    /// The leader window, not the cost model, is what runs out on mainnet: bundles still in
+    /// the buffer when the window closes are cleared, and the tip on a cleared bundle was
+    /// measured at five times the tip on a landed one. Under FIFO the order they are tried
+    /// in is the order the engine happened to deliver them.
+    TipPriority,
+}
+
+impl BundleOrdering {
+    /// `FLOWRA_BUNDLE_TIP_PRIORITY=1` selects [`Self::TipPriority`]; anything else is FIFO.
+    pub fn from_env() -> Self {
+        match std::env::var("FLOWRA_BUNDLE_TIP_PRIORITY").as_deref() {
+            Ok("1") => Self::TipPriority,
+            _ => Self::Fifo,
+        }
+    }
+}
 
 /// Bundles removed by [`BundleStorage::prune_stale`], by the reason the working bank would
 /// have rejected them.
@@ -47,6 +75,99 @@ struct BundleTransactionId {
     container_ids: SmallVec<[usize; 5]>,
     sanitized_bank_id: BankId,
     sanitized_bank_slot: Slot,
+    /// Lamports the bundle transfers to tip accounts, summed over its transactions. Computed
+    /// once at insert; always zero under [`BundleOrdering::Fifo`].
+    tip_lamports: u64,
+    /// Arrival sequence number; the tie-break under tip ordering.
+    seq: u64,
+}
+
+/// Heap key for tip ordering: highest tip first, earliest arrival among equals.
+struct ByTip(BundleTransactionId);
+
+impl PartialEq for ByTip {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.tip_lamports == other.0.tip_lamports && self.0.seq == other.0.seq
+    }
+}
+impl Eq for ByTip {}
+impl PartialOrd for ByTip {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ByTip {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .tip_lamports
+            .cmp(&other.0.tip_lamports)
+            .then_with(|| other.0.seq.cmp(&self.0.seq))
+    }
+}
+
+/// The unprocessed queue, in whichever order the storage was built with.
+enum BundleQueue {
+    Fifo(VecDeque<BundleTransactionId>),
+    Tip(BinaryHeap<ByTip>),
+}
+
+impl BundleQueue {
+    fn with_capacity(ordering: BundleOrdering, capacity: usize) -> Self {
+        match ordering {
+            BundleOrdering::Fifo => Self::Fifo(VecDeque::with_capacity(capacity)),
+            BundleOrdering::TipPriority => Self::Tip(BinaryHeap::with_capacity(capacity)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Fifo(queue) => queue.len(),
+            Self::Tip(heap) => heap.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn push(&mut self, bundle: BundleTransactionId) {
+        match self {
+            Self::Fifo(queue) => queue.push_back(bundle),
+            Self::Tip(heap) => heap.push(ByTip(bundle)),
+        }
+    }
+
+    fn pop(&mut self) -> Option<BundleTransactionId> {
+        match self {
+            Self::Fifo(queue) => queue.pop_front(),
+            Self::Tip(heap) => heap.pop().map(|entry| entry.0),
+        }
+    }
+
+    fn drain(&mut self) -> Vec<BundleTransactionId> {
+        match self {
+            Self::Fifo(queue) => queue.drain(..).collect(),
+            Self::Tip(heap) => heap.drain().map(|entry| entry.0).collect(),
+        }
+    }
+
+    /// Fold the cost-model retry queue back in at a slot boundary. Under FIFO the retries
+    /// go ahead of everything that arrived since, oldest first, as before; under tip
+    /// ordering they simply take their place by tip, with their original arrival as the
+    /// tie-break.
+    fn requeue_retries(&mut self, retries: &mut VecDeque<BundleTransactionId>) {
+        match self {
+            Self::Fifo(queue) => {
+                // the retry queue has the oldest bundles at the front; pop from the back and
+                // push to the front so the oldest ends up at the front of the queue
+                while let Some(bundle) = retries.pop_back() {
+                    queue.push_front(bundle);
+                }
+            }
+            Self::Tip(heap) => heap.extend(retries.drain(..).map(ByTip)),
+        }
+    }
 }
 
 pub struct BundleStorageEntry {
@@ -55,15 +176,22 @@ pub struct BundleStorageEntry {
     pub max_ages: SmallVec<[MaxAge; 5]>,
     sanitized_bank_id: BankId,
     sanitized_bank_slot: Slot,
+    tip_lamports: u64,
+    seq: u64,
 }
 
-/// Bundle storage has two deques: one for unprocessed bundles and another for ones that exceeded
+/// Bundle storage has two queues: one for unprocessed bundles and another for ones that exceeded
 /// the cost model and need to get retried next slot.
 pub struct BundleStorage {
     last_slot: Slot,
     transaction_capacity: usize,
     transaction_view_state_container: TransactionViewStateContainer,
-    unprocessed_bundles: VecDeque<BundleTransactionId>,
+    ordering: BundleOrdering,
+    /// Tip-account PDAs of every managed tip program; what a transfer must target to count as a
+    /// tip. Empty under FIFO, where tips are not computed.
+    tip_accounts: std::collections::HashSet<Pubkey>,
+    next_seq: u64,
+    unprocessed_bundles: BundleQueue,
     // Storage for bundles that exceeded the cost model for the slot they were last attempted
     // execution on
     cost_model_buffered_bundles: VecDeque<BundleTransactionId>,
@@ -74,18 +202,41 @@ pub struct BundleStorage {
 impl BundleStorage {
     const MAX_PACKETS_PER_BUNDLE: usize = 5;
 
+    /// FIFO storage.
     #[allow(unused)]
     pub fn with_capacity(transaction_capacity: usize) -> Self {
+        Self::with_ordering(
+            transaction_capacity,
+            BundleOrdering::Fifo,
+            std::collections::HashSet::new(),
+        )
+    }
+
+    /// Storage handing bundles out in `ordering`. `tip_accounts` is only consulted under
+    /// [`BundleOrdering::TipPriority`].
+    pub fn with_ordering(
+        transaction_capacity: usize,
+        ordering: BundleOrdering,
+        tip_accounts: std::collections::HashSet<Pubkey>,
+    ) -> Self {
         Self {
             last_slot: Slot::default(),
             transaction_capacity,
             transaction_view_state_container: TransactionViewStateContainer::with_capacity(
                 transaction_capacity,
             ),
-            unprocessed_bundles: VecDeque::with_capacity(transaction_capacity),
+            ordering,
+            tip_accounts,
+            next_seq: 0,
+            unprocessed_bundles: BundleQueue::with_capacity(ordering, transaction_capacity),
             cost_model_buffered_bundles: VecDeque::with_capacity(transaction_capacity),
             last_pruned_bank: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ordering(&self) -> BundleOrdering {
+        self.ordering
     }
 
     /// Drop buffered bundles that `bank` would reject before execution: an expired (or
@@ -114,52 +265,51 @@ impl BundleStorage {
         let max_age = bank.max_processing_age();
         let container = &mut self.transaction_view_state_container;
 
-        for queue in [
-            &mut self.unprocessed_bundles,
-            &mut self.cost_model_buffered_bundles,
-        ] {
-            let mut kept = VecDeque::with_capacity(queue.len());
-            while let Some(bundle) = queue.pop_front() {
-                let verdict = {
-                    let transactions: SmallVec<[&RuntimeTransactionView; 5]> = bundle
-                        .container_ids
-                        .iter()
-                        .map(|id| {
-                            container
-                                .get_transaction(*id)
-                                .expect("transaction must exist")
-                        })
-                        .collect();
-                    let lock_results: SmallVec<[Result<(), TransactionError>; 5]> =
-                        SmallVec::from_elem(Ok(()), transactions.len());
-                    bank.check_transactions::<RuntimeTransactionView>(
-                        &transactions,
-                        &lock_results,
-                        max_age,
-                        true,
-                        &mut error_counters,
-                    )
-                    .into_iter()
-                    .find_map(|result| result.err())
-                };
-
-                match verdict {
-                    Some(TransactionError::BlockhashNotFound) => {
-                        stats.stale_blockhash += 1;
-                    }
-                    Some(TransactionError::AlreadyProcessed) => {
-                        stats.already_processed += 1;
-                    }
-                    _ => {
-                        kept.push_back(bundle);
-                        continue;
-                    }
-                }
-                for container_id in bundle.container_ids {
-                    container.remove_by_id(container_id);
-                }
+        // Returns true when the bundle should stay, after counting it if it goes.
+        let mut keep = |bundle: &BundleTransactionId, stats: &mut PruneStats| -> bool {
+            let verdict = {
+                let transactions: SmallVec<[&RuntimeTransactionView; 5]> = bundle
+                    .container_ids
+                    .iter()
+                    .map(|id| {
+                        container
+                            .get_transaction(*id)
+                            .expect("transaction must exist")
+                    })
+                    .collect();
+                let lock_results: SmallVec<[Result<(), TransactionError>; 5]> =
+                    SmallVec::from_elem(Ok(()), transactions.len());
+                bank.check_transactions::<RuntimeTransactionView>(
+                    &transactions,
+                    &lock_results,
+                    max_age,
+                    true,
+                    &mut error_counters,
+                )
+                .into_iter()
+                .find_map(|result| result.err())
+            };
+            match verdict {
+                Some(TransactionError::BlockhashNotFound) => stats.stale_blockhash += 1,
+                Some(TransactionError::AlreadyProcessed) => stats.already_processed += 1,
+                _ => return true,
             }
-            *queue = kept;
+            for container_id in bundle.container_ids.iter() {
+                container.remove_by_id(*container_id);
+            }
+            false
+        };
+
+        for bundle in self.unprocessed_bundles.drain() {
+            if keep(&bundle, &mut stats) {
+                self.unprocessed_bundles.push(bundle);
+            }
+        }
+        let retries = std::mem::take(&mut self.cost_model_buffered_bundles);
+        for bundle in retries {
+            if keep(&bundle, &mut stats) {
+                self.cost_model_buffered_bundles.push_back(bundle);
+            }
         }
 
         stats
@@ -191,6 +341,8 @@ impl BundleStorage {
                 container_ids: bundle.container_ids,
                 sanitized_bank_id: bundle.sanitized_bank_id,
                 sanitized_bank_slot: bundle.sanitized_bank_slot,
+                tip_lamports: bundle.tip_lamports,
+                seq: bundle.seq,
             });
     }
 
@@ -208,18 +360,13 @@ impl BundleStorage {
     /// Returns None if there are no bundles to pop.
     pub fn pop_bundle(&mut self, slot: Slot, bank_id: BankId) -> Option<BundleStorageEntry> {
         if slot != self.last_slot {
-            // the cost_model_buffered_bundles has the oldest bundles at the front of the queue
-            // we need to pop from the back of that queue and insert to the front of the unprocessed_bundles queue so by the time we reach the front,
-            // the oldest bundle is at the front of the unprocessed_bundles queue
-            while let Some(bundle) = self.cost_model_buffered_bundles.pop_back() {
-                self.unprocessed_bundles.push_front(bundle);
-            }
-
+            self.unprocessed_bundles
+                .requeue_retries(&mut self.cost_model_buffered_bundles);
             self.last_slot = slot;
         }
 
         // only want to pop from the unprocessed bundles queue and wait for slot boundary to refresh from cost_model_buffered_bundles
-        while let Some(bundle) = self.unprocessed_bundles.pop_front() {
+        while let Some(bundle) = self.unprocessed_bundles.pop() {
             if bundle.sanitized_bank_slot == slot && bundle.sanitized_bank_id != bank_id {
                 for container_id in bundle.container_ids {
                     self.transaction_view_state_container
@@ -248,6 +395,8 @@ impl BundleStorage {
                 max_ages: bundle_max_ages,
                 sanitized_bank_id: bundle.sanitized_bank_id,
                 sanitized_bank_slot: bundle.sanitized_bank_slot,
+                tip_lamports: bundle.tip_lamports,
+                seq: bundle.seq,
             });
         }
 
@@ -347,10 +496,28 @@ impl BundleStorage {
             return Err(BundleStorageError::DuplicateTransaction);
         }
 
-        self.unprocessed_bundles.push_back(BundleTransactionId {
+        let tip_lamports = match self.ordering {
+            BundleOrdering::Fifo => 0,
+            BundleOrdering::TipPriority => container_ids
+                .iter()
+                .map(|id| {
+                    let transaction = self
+                        .transaction_view_state_container
+                        .get_transaction(*id)
+                        .expect("transaction must exist");
+                    transaction_tip_lamports(transaction, &self.tip_accounts)
+                })
+                .fold(0u64, u64::saturating_add),
+        };
+        let seq = self.next_seq;
+        self.next_seq += 1;
+
+        self.unprocessed_bundles.push(BundleTransactionId {
             container_ids,
             sanitized_bank_id: working_bank.bank_id(),
             sanitized_bank_slot: working_bank.slot(),
+            tip_lamports,
+            seq,
         });
 
         Ok(())
@@ -373,7 +540,7 @@ impl BundleStorage {
     }
 
     pub fn clear(&mut self) {
-        for bundle in self.unprocessed_bundles.drain(..) {
+        for bundle in self.unprocessed_bundles.drain() {
             for id in bundle.container_ids.iter() {
                 self.transaction_view_state_container.remove_by_id(*id);
             }
@@ -394,7 +561,9 @@ mod tests {
                 receive_and_buffer::PacketHandlingError,
                 transaction_state_container::StateContainer,
             },
-            bundle_stage::bundle_storage::{BundleStorage, BundleStorageError, PruneStats},
+            bundle_stage::bundle_storage::{
+                BundleOrdering, BundleStorage, BundleStorageEntry, BundleStorageError, PruneStats,
+            },
             packet_bundle::VerifiedPacketBundle,
         },
         ahash::{HashSet, HashSetExt},
@@ -411,6 +580,7 @@ mod tests {
         solana_perf::packet::{BytesPacket, PacketBatch},
         solana_pubkey::Pubkey,
         solana_runtime::bank::{Bank, NewBankOptions},
+        solana_signature::Signature,
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_transaction::{Transaction, versioned::VersionedTransaction},
@@ -544,6 +714,207 @@ mod tests {
         );
         assert_eq!(bundle_storage.cost_model_buffered_bundles_len(), 0);
         assert_eq!(bundle_storage.num_packets_buffered(), 0);
+    }
+
+    fn tip_tx(payer: &Keypair, tip_account: &Pubkey, lamports: u64) -> Transaction {
+        solana_system_transaction::transfer(payer, tip_account, lamports, Hash::default())
+    }
+
+    fn tip_storage(tip_account: Pubkey) -> BundleStorage {
+        BundleStorage::with_ordering(
+            100,
+            BundleOrdering::TipPriority,
+            std::collections::HashSet::from([tip_account]),
+        )
+    }
+
+    fn first_signature(entry: &BundleStorageEntry) -> Signature {
+        entry.transactions[0].signatures()[0]
+    }
+
+    /// Pop every bundle in order, returning each one's leading signature.
+    fn pop_all(storage: &mut BundleStorage, slot: u64, bank_id: u64) -> Vec<Signature> {
+        let mut order = Vec::new();
+        while let Some(entry) = storage.pop_bundle(slot, bank_id) {
+            order.push(first_signature(&entry));
+            storage.destroy_bundle(entry);
+        }
+        order
+    }
+
+    #[test]
+    fn test_tip_priority_pops_highest_tip_first() {
+        let bank = Bank::new_for_tests(&GenesisConfig::default());
+        let tip_account = Pubkey::new_unique();
+        let payer = Keypair::new();
+        let mut storage = tip_storage(tip_account);
+        assert_eq!(storage.ordering(), BundleOrdering::TipPriority);
+
+        let txs: Vec<Transaction> = [100, 300, 200]
+            .iter()
+            .map(|lamports| tip_tx(&payer, &tip_account, *lamports))
+            .collect();
+        for tx in &txs {
+            storage
+                .insert_bundle(bundle_of(tx.clone()), &bank, &bank, &HashSet::new())
+                .unwrap();
+        }
+
+        assert_eq!(
+            pop_all(&mut storage, bank.slot(), bank.bank_id()),
+            vec![
+                txs[1].signatures[0],
+                txs[2].signatures[0],
+                txs[0].signatures[0]
+            ]
+        );
+        assert_eq!(storage.num_packets_buffered(), 0);
+    }
+
+    #[test]
+    fn test_tip_priority_equal_tips_keep_arrival_order() {
+        let bank = Bank::new_for_tests(&GenesisConfig::default());
+        let tip_account = Pubkey::new_unique();
+        let mut storage = tip_storage(tip_account);
+
+        // Distinct payers so the transactions differ while the tips do not.
+        let txs: Vec<Transaction> = (0..3)
+            .map(|_| tip_tx(&Keypair::new(), &tip_account, 100))
+            .collect();
+        for tx in &txs {
+            storage
+                .insert_bundle(bundle_of(tx.clone()), &bank, &bank, &HashSet::new())
+                .unwrap();
+        }
+
+        assert_eq!(
+            pop_all(&mut storage, bank.slot(), bank.bank_id()),
+            txs.iter().map(|tx| tx.signatures[0]).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_tip_priority_untipped_bundle_sorts_last() {
+        let bank = Bank::new_for_tests(&GenesisConfig::default());
+        let tip_account = Pubkey::new_unique();
+        let mut storage = tip_storage(tip_account);
+
+        // A transfer to something other than a tip account is not a tip.
+        let untipped = tip_tx(&Keypair::new(), &Pubkey::new_unique(), 1_000_000);
+        let tipped = tip_tx(&Keypair::new(), &tip_account, 50);
+        storage
+            .insert_bundle(bundle_of(untipped.clone()), &bank, &bank, &HashSet::new())
+            .unwrap();
+        storage
+            .insert_bundle(bundle_of(tipped.clone()), &bank, &bank, &HashSet::new())
+            .unwrap();
+
+        assert_eq!(
+            pop_all(&mut storage, bank.slot(), bank.bank_id()),
+            vec![tipped.signatures[0], untipped.signatures[0]]
+        );
+    }
+
+    #[test]
+    fn test_tip_priority_retries_merge_by_tip_next_slot() {
+        let bank = Bank::new_for_tests(&GenesisConfig::default());
+        let bank_id = bank.bank_id();
+        let tip_account = Pubkey::new_unique();
+        let payer = Keypair::new();
+        let mut storage = tip_storage(tip_account);
+
+        let retried = tip_tx(&payer, &tip_account, 300);
+        storage
+            .insert_bundle(bundle_of(retried.clone()), &bank, &bank, &HashSet::new())
+            .unwrap();
+        let entry = storage.pop_bundle(bank.slot(), bank_id).unwrap();
+        storage.retry_bundle(entry);
+        assert_eq!(storage.cost_model_buffered_bundles_len(), 1);
+
+        // Two arrive after the retry: one richer, one poorer.
+        let richer = tip_tx(&payer, &tip_account, 500);
+        let poorer = tip_tx(&payer, &tip_account, 100);
+        for tx in [&richer, &poorer] {
+            storage
+                .insert_bundle(bundle_of(tx.clone()), &bank, &bank, &HashSet::new())
+                .unwrap();
+        }
+        // Still the same slot: the retry stays parked.
+        let entry = storage.pop_bundle(bank.slot(), bank_id).unwrap();
+        assert_eq!(first_signature(&entry), richer.signatures[0]);
+        storage.destroy_bundle(entry);
+
+        // Next slot: the retry is folded back in by tip, ahead of the poorer newcomer.
+        assert_eq!(
+            pop_all(&mut storage, bank.slot() + 1, bank_id),
+            vec![retried.signatures[0], poorer.signatures[0]]
+        );
+        assert_eq!(storage.cost_model_buffered_bundles_len(), 0);
+    }
+
+    #[test]
+    fn test_fifo_ignores_tips() {
+        let bank = Bank::new_for_tests(&GenesisConfig::default());
+        let tip_account = Pubkey::new_unique();
+        let payer = Keypair::new();
+        let mut storage = BundleStorage::with_capacity(100);
+        assert_eq!(storage.ordering(), BundleOrdering::Fifo);
+
+        let small = tip_tx(&payer, &tip_account, 100);
+        let large = tip_tx(&payer, &tip_account, 300);
+        for tx in [&small, &large] {
+            storage
+                .insert_bundle(bundle_of(tx.clone()), &bank, &bank, &HashSet::new())
+                .unwrap();
+        }
+        assert_eq!(
+            pop_all(&mut storage, bank.slot(), bank.bank_id()),
+            vec![small.signatures[0], large.signatures[0]]
+        );
+    }
+
+    #[test]
+    fn test_prune_stale_keeps_tip_order() {
+        let (genesis_config, mint_keypair) = create_genesis_config(10_000_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let tip_account = Pubkey::new_unique();
+        let mut storage = tip_storage(tip_account);
+
+        let dead = solana_system_transaction::transfer(
+            &mint_keypair,
+            &tip_account,
+            900,
+            Hash::new_unique(),
+        );
+        let live_small = solana_system_transaction::transfer(
+            &mint_keypair,
+            &tip_account,
+            100,
+            bank.last_blockhash(),
+        );
+        let live_large = solana_system_transaction::transfer(
+            &mint_keypair,
+            &tip_account,
+            300,
+            bank.last_blockhash(),
+        );
+        for tx in [&dead, &live_small, &live_large] {
+            storage
+                .insert_bundle(bundle_of(tx.clone()), &bank, &bank, &HashSet::new())
+                .unwrap();
+        }
+
+        assert_eq!(
+            storage.prune_stale(&bank),
+            PruneStats {
+                stale_blockhash: 1,
+                already_processed: 0
+            }
+        );
+        assert_eq!(
+            pop_all(&mut storage, bank.slot(), bank.bank_id()),
+            vec![live_large.signatures[0], live_small.signatures[0]]
+        );
     }
 
     pub fn test_tx() -> Transaction {

@@ -48,7 +48,7 @@ pub fn set_tip_accounts(tip_accounts: impl IntoIterator<Item = Pubkey>) {
 /// loaded and there is nothing to resolve an ALT index against. A tip whose
 /// destination is carried in a lookup table is therefore not counted; the tip
 /// PDAs are a small, well-known set that senders pass directly.
-fn transaction_tip_lamports(
+pub(crate) fn transaction_tip_lamports(
     transaction: &impl SVMStaticMessage,
     tip_accounts: &HashSet<Pubkey>,
 ) -> u64 {
