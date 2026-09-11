@@ -59,6 +59,7 @@ use {
     },
     solana_client::connection_cache::{ConnectionCache, Protocol},
     solana_clock::Slot,
+    solana_cluster_type::ClusterType,
     solana_entry::poh::compute_hash_time,
     solana_epoch_schedule::MAX_LEADER_SCHEDULE_EPOCH_OFFSET,
     solana_genesis_config::GenesisConfig,
@@ -394,6 +395,9 @@ pub struct ValidatorConfig {
     pub validator_exit_backpressure: HashMap<String, Arc<AtomicBool>>,
     pub no_wait_for_vote_to_start_leader: bool,
     pub wait_to_vote_slot: Option<Slot>,
+    // Development-only; see ReplayStageConfig::duplicate_slot_repair_bypass. Validator::new
+    // refuses to start with this set on anything but a Development or Devnet genesis.
+    pub duplicate_slot_repair_bypass: bool,
     pub runtime_config: RuntimeConfig,
     pub banking_trace_dir_byte_limit: banking_trace::DirByteLimit,
     pub block_verification_method: BlockVerificationMethod,
@@ -427,7 +431,7 @@ pub struct ValidatorConfig {
     pub shred_retransmit_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
     /// Automatically detected multicast destination for leader shreds.
     pub multicast_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
-    pub tip_manager_config: TipManagerConfig,
+    pub tip_manager_configs: Vec<TipManagerConfig>,
     pub bam_url: Arc<ArcSwap<Option<String>>>,
     /// Skips automatic multicast route detection and multicast receiver updates.
     pub disable_multicast_shred_check: bool,
@@ -493,6 +497,7 @@ impl ValidatorConfig {
             no_wait_for_vote_to_start_leader: true,
             accounts_db_config: ACCOUNTS_DB_CONFIG_FOR_TESTING,
             wait_to_vote_slot: None,
+            duplicate_slot_repair_bypass: false,
             runtime_config: RuntimeConfig::default(),
             banking_trace_dir_byte_limit: 0,
             block_verification_method: BlockVerificationMethod::default(),
@@ -525,7 +530,7 @@ impl ValidatorConfig {
                 ShredReceiverAddresses::new(),
             )),
             multicast_receiver_address: Arc::new(ArcSwap::from_pointee(None)),
-            tip_manager_config: TipManagerConfig::default(),
+            tip_manager_configs: vec![TipManagerConfig::default()],
             bam_url: Arc::new(ArcSwap::from_pointee(None)),
             disable_multicast_shred_check: false,
         }
@@ -916,6 +921,20 @@ impl Validator {
         }
         let genesis_config = load_genesis(config, ledger_path)?;
         metrics_config_sanity_check(genesis_config.cluster_type)?;
+
+        if config.duplicate_slot_repair_bypass
+            && !matches!(
+                genesis_config.cluster_type,
+                ClusterType::Development | ClusterType::Devnet
+            )
+        {
+            return Err(anyhow!(
+                "--dangerous-duplicate-slot-repair-bypass suppresses a panic that exists to stop \
+                 a node that disagrees with the cluster on a bank hash. It is only accepted on a \
+                 development or devnet genesis, not on {:?}",
+                genesis_config.cluster_type
+            ));
+        }
 
         info!("Validating accounts paths...");
         *start_progress.write().unwrap() = ValidatorStartProgress::CleaningAccounts;
@@ -1766,6 +1785,7 @@ impl Validator {
                 bls_sigverify_threads: config.tvu_bls_sigverify_threads,
                 turbine_xdp_sender: turbine_xdp_sender.clone(),
                 repair_xdp_sender,
+                duplicate_slot_repair_bypass: config.duplicate_slot_repair_bypass,
             },
             &max_slots,
             block_metadata_notifier,
@@ -1880,7 +1900,7 @@ impl Validator {
             votor_event_sender.clone(),
             config.block_engine_config.clone(),
             config.relayer_config.clone(),
-            config.tip_manager_config.clone(),
+            config.tip_manager_configs.clone(),
             shredstream_receiver_address,
             config.shred_receiver_addresses.clone(),
             bam_shred_receiver_addresses,
