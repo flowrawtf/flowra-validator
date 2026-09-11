@@ -49,6 +49,23 @@ const DESATURATION_BUFFER_PCT: u8 = 95;
 #[derive(Clone)]
 pub struct SchedulerConfig {
     pub scheduler_pacing: SchedulerPacing,
+    /// Total in-flight CU the scheduler may hold across all worker threads.
+    /// `None` derives it from the leader bank's block cost limit (a quarter of
+    /// it), so it tracks feature-gated limit raises — SIMD-0286 took the block
+    /// limit from 60M to 100M, and a hard-coded `MAX_BLOCK_UNITS / 4` would
+    /// have left the scheduler sized for the old limit indefinitely.
+    ///
+    /// This matters because the schedulers divide it by the worker count to get a
+    /// per-thread quota, and a thread over quota is dropped from the schedulable set for
+    /// the rest of the pass. A transaction whose accounts are already locked by that
+    /// thread has nowhere else to go, so it comes back as `UnschedulableThread`.
+    ///
+    /// Since the total is fixed, **raising the worker count shrinks every thread's quota**:
+    /// 4 workers get 3.75M CU each, 8 workers get 1.875M. That penalises exactly the
+    /// serialized hot-account chain that carries most of a block's compute. Measured on
+    /// mainnet with 8 workers, non-opening leader slots reported up to 11,866
+    /// `UnschedulableThread` against 996 scheduled.
+    pub target_scheduled_cus: Option<u64>,
 }
 
 impl Default for SchedulerConfig {
@@ -57,6 +74,7 @@ impl Default for SchedulerConfig {
             scheduler_pacing: SchedulerPacing::FillTimeMillis(
                 DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS,
             ),
+            target_scheduled_cus: None,
         }
     }
 }
@@ -321,6 +339,13 @@ where
                         fill_time,
                     }
                 });
+
+                // The block limit changes on feature activation (SIMD-0286
+                // raised it from 60M to 100M), so a scheduler that derives its
+                // in-flight CU budget from it has to be told each leader slot.
+                if let Some(pacer) = cost_pacer.as_ref() {
+                    self.scheduler.set_block_limit(pacer.block_limit);
+                }
             }
 
             self.receive_completed(&decision)?;
@@ -589,6 +614,9 @@ where
                 num_dropped_on_lock_validation,
                 num_dropped_on_compute_budget,
                 num_dropped_on_age,
+                num_dropped_on_age_hash_unknown,
+                num_dropped_on_age_hash_known,
+                dropped_on_age_slots_sum,
                 num_dropped_on_already_processed,
                 num_dropped_on_fee_payer,
                 num_dropped_on_filter_key,
@@ -608,6 +636,10 @@ where
             count_metrics.num_dropped_on_validate_locks += *num_dropped_on_lock_validation;
             count_metrics.num_dropped_on_receive_compute_budget += *num_dropped_on_compute_budget;
             count_metrics.num_dropped_on_receive_age += *num_dropped_on_age;
+            count_metrics.num_dropped_on_receive_age_hash_unknown +=
+                *num_dropped_on_age_hash_unknown;
+            count_metrics.num_dropped_on_receive_age_hash_known += *num_dropped_on_age_hash_known;
+            count_metrics.dropped_on_receive_age_slots_sum += *dropped_on_age_slots_sum;
             count_metrics.num_dropped_on_receive_already_processed +=
                 *num_dropped_on_already_processed;
             count_metrics.num_dropped_on_receive_fee_payer += *num_dropped_on_fee_payer;

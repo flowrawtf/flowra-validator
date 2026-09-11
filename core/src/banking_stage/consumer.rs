@@ -7,7 +7,7 @@ use {
     },
     crate::{
         bundle_stage::bundle_account_locker::BundleAccountLocker,
-        proxy::block_engine_stage::BlockBuilderFeeInfo, tip_manager::TipManager,
+        proxy::block_engine_stage::BlockBuilderFeeInfo, tip_manager::TipManagers,
     },
     arc_swap::ArcSwap,
     smallvec::SmallVec,
@@ -112,7 +112,7 @@ pub struct LeaderProcessedTransactionCounts {
 
 #[derive(Clone)]
 pub struct TipProcessingDependencies {
-    pub tip_manager: TipManager,
+    pub tip_managers: TipManagers,
     pub block_builder_fee_info: Arc<ArcSwap<BlockBuilderFeeInfo>>,
     pub cluster_info: Arc<ClusterInfo>,
     pub bundle_account_locker: BundleAccountLocker,
@@ -153,14 +153,38 @@ impl TipProcessingDependencies {
                 })
             })
         };
-        // Crank construction reads the accounts created by initialization; keep it lazy.
-        process(
-            self.tip_manager
-                .get_initialize_tip_programs_bundle(bank, &keypair),
-        ) && process(
-            self.tip_manager
-                .get_tip_programs_crank_bundle(bank, &keypair, &builder),
-        )
+        // Each program is cranked on its own. Only our own (primary) program gates BAM
+        // admission; an upstream program we cannot crank is logged and must not cost us
+        // the slot.
+        let mut primary_ok = true;
+        for (i, tip_manager) in self.tip_managers.iter().enumerate() {
+            let program = tip_manager.tip_payment_program_id();
+            // Crank construction reads the accounts created by initialization; keep it lazy.
+            let ok = process(tip_manager.get_initialize_tip_programs_bundle(bank, &keypair))
+                && match tip_manager.get_crank_steps(bank, &keypair, &builder) {
+                    Ok(steps) => {
+                        let mut steps_ok = true;
+                        for step in steps {
+                            if !process(Ok(step.txs)) {
+                                warn!("tip program {program} crank step {} did not commit", step.label);
+                                steps_ok = false;
+                                if step.blocking {
+                                    break;
+                                }
+                            }
+                        }
+                        steps_ok
+                    }
+                    Err(e) => {
+                        error!("tip program {program} crank could not be built: {e:?}");
+                        false
+                    }
+                };
+            if !ok && i == 0 {
+                primary_ok = false;
+            }
+        }
+        primary_ok
     }
 }
 
