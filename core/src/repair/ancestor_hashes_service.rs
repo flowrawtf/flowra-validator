@@ -2036,6 +2036,7 @@ mod test {
             &dumped_slots_sender,
             &my_pubkey,
             &leader_schedule_cache,
+            false,
         );
 
         // Simulate making a request

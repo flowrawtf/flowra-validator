@@ -165,6 +165,8 @@ pub struct TvuConfig {
     pub turbine_xdp_sender: Option<TurbineXdpSender>,
     pub repair_xdp_sender: Option<PinnedXdpSender>,
     pub(crate) replay_arena: Option<Arena>,
+    // Development-only; see ReplayStageConfig::duplicate_slot_repair_bypass.
+    pub duplicate_slot_repair_bypass: bool,
 }
 
 impl Default for TvuConfig {
@@ -182,6 +184,7 @@ impl Default for TvuConfig {
             turbine_xdp_sender: None,
             repair_xdp_sender: None,
             replay_arena: None,
+            duplicate_slot_repair_bypass: false,
         }
     }
 }
@@ -634,6 +637,7 @@ impl Tvu {
             replay_highest_frozen,
             highest_parent_ready,
             replay_arena: tvu_config.replay_arena,
+            duplicate_slot_repair_bypass: tvu_config.duplicate_slot_repair_bypass,
         };
 
         let voting_service = VotingService::new(
