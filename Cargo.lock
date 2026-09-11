@@ -7250,6 +7250,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c4dec15c69d94074ef92131303fed68dbccae2472cf09409d9205c180fe5258"
 dependencies = [
  "bincode",
+ "qualifier_attr",
  "serde",
  "serde_bytes",
  "serde_derive",
@@ -8456,6 +8457,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util 0.7.19",
+ "toml 0.9.12+spec-1.1.0",
  "tonic",
  "tonic-build",
  "trees",
@@ -11588,6 +11590,60 @@ name = "solana-time-utils"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ced92c60aa76ec4780a9d93f3bd64dfa916e1b998eacc6f1c110f3f444f02c9"
+
+[[package]]
+name = "solana-tip-distributor"
+version = "4.3.0-rc.0"
+dependencies = [
+ "agave-feature-set",
+ "agave-snapshots",
+ "borsh",
+ "clap 4.5.31",
+ "crossbeam-channel",
+ "env_logger",
+ "futures 0.3.33",
+ "gethostname",
+ "imbl",
+ "itertools 0.14.0",
+ "log",
+ "num-traits",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "solana-account 4.5.0",
+ "solana-accounts-db",
+ "solana-client",
+ "solana-commitment-config",
+ "solana-compute-budget-interface",
+ "solana-genesis-utils",
+ "solana-instruction",
+ "solana-keypair",
+ "solana-ledger",
+ "solana-measure",
+ "solana-merkle-tree",
+ "solana-metrics",
+ "solana-program",
+ "solana-program-runtime",
+ "solana-pubkey 4.3.0",
+ "solana-rent",
+ "solana-rpc-client-api",
+ "solana-runtime",
+ "solana-sdk-ids",
+ "solana-shred-version",
+ "solana-signature",
+ "solana-signer",
+ "solana-stake-history",
+ "solana-stake-interface",
+ "solana-system-interface 3.3.0",
+ "solana-sysvar",
+ "solana-transaction",
+ "solana-transaction-error",
+ "solana-transaction-status",
+ "solana-vote",
+ "thiserror 2.0.19",
+ "tokio",
+ "wincode",
+]
 
 [[package]]
 name = "solana-tls-utils"
