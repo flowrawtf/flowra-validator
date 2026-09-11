@@ -56,7 +56,8 @@ use {
     tokio_util::sync::CancellationToken,
     transaction_scheduler::{
         check_worker::spawn_check_workers,
-        greedy_scheduler::{GreedyScheduler, GreedySchedulerConfig},
+        conflict_aware_scheduler::{ConflictAwareScheduler, ConflictAwareSchedulerConfig},
+        greedy_scheduler::{BLOCK_LIMIT_IN_FLIGHT_DIVISOR, GreedyScheduler, GreedySchedulerConfig},
         receive_and_buffer::TransactionViewReceiveAndBuffer,
     },
     vote_worker::VoteWorker,
@@ -667,14 +668,54 @@ impl BankingStage {
             };
         }
 
+        // Total in-flight CU across all worker threads. The schedulers divide this by the
+        // worker count, so leaving it fixed while raising `--block-production-num-workers`
+        // silently shrinks each thread's quota — see `SchedulerConfig::target_scheduled_cus`.
+        // When unset the schedulers derive it per leader slot from the bank's block limit,
+        // so it cannot be printed here.
+        let target_scheduled_cus = scheduler_config.target_scheduled_cus;
+        match target_scheduled_cus {
+            Some(cus) => info!(
+                "Scheduler in-flight CU budget: {cus} total across {num_workers} worker(s) = {} \
+                 per worker",
+                cus / num_workers as u64
+            ),
+            None => info!(
+                "Scheduler in-flight CU budget: block limit / {BLOCK_LIMIT_IN_FLIGHT_DIVISOR}, \
+                 across {num_workers} worker(s)"
+            ),
+        }
+
         // Both block production methods currently route to the greedy scheduler.
-        let scheduler = GreedyScheduler::new_with_bundle_locker(
-            work_senders,
-            finished_work_receiver,
-            GreedySchedulerConfig::default(),
-            bundle_account_locker.clone(),
-        );
-        spawn_scheduler!(scheduler);
+        // FLOWRA PoC: `FLOWRA_SCHEDULER=conflict-aware` selects the
+        // conflict-aware scheduler; anything else keeps the default greedy
+        // scheduler. The two branches produce different concrete scheduler
+        // types, so each invokes `spawn_scheduler!` separately (only one branch
+        // runs, so the captured channels are moved exactly once).
+        if std::env::var("FLOWRA_SCHEDULER").as_deref() == Ok("conflict-aware") {
+            info!("FLOWRA PoC: using conflict-aware scheduler");
+            let scheduler = ConflictAwareScheduler::new(
+                work_senders,
+                finished_work_receiver,
+                ConflictAwareSchedulerConfig {
+                    target_scheduled_cus,
+                    ..ConflictAwareSchedulerConfig::default()
+                },
+                bundle_account_locker.clone(),
+            );
+            spawn_scheduler!(scheduler);
+        } else {
+            let scheduler = GreedyScheduler::new_with_bundle_locker(
+                work_senders,
+                finished_work_receiver,
+                GreedySchedulerConfig {
+                    target_scheduled_cus,
+                    ..GreedySchedulerConfig::default()
+                },
+                bundle_account_locker.clone(),
+            );
+            spawn_scheduler!(scheduler);
+        }
 
         if let Some(bam_dependencies) = bam_dependencies {
             // Spawn BAM workers
@@ -1130,6 +1171,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                target_scheduled_cus: None,
             },
             None,
             replay_vote_sender,
@@ -1200,6 +1242,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                target_scheduled_cus: None,
             },
             None,
             replay_vote_sender,
@@ -1282,6 +1325,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                target_scheduled_cus: None,
             },
             None,
             replay_vote_sender,
@@ -1438,6 +1482,7 @@ mod tests {
                 DEFAULT_NUM_WORKERS,
                 SchedulerConfig {
                     scheduler_pacing: SchedulerPacing::Disabled,
+                    target_scheduled_cus: None,
                 },
                 None,
                 replay_vote_sender,
@@ -1606,6 +1651,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                target_scheduled_cus: None,
             },
             None,
             replay_vote_sender,
