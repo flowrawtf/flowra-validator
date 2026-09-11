@@ -10,15 +10,18 @@ use {
             consumer::ProcessTransactionBatchOutput,
             decision_maker::{BufferedPacketsDecision, DecisionMaker},
             scheduler_messages::MaxAge,
+            transaction_scheduler::receive_and_buffer::PacketHandlingError,
         },
         bundle_stage::{
             bundle_account_locker::BundleAccountLocker,
             bundle_consumer::BundleConsumer,
-            bundle_storage::{BundleStorage, BundleStorageEntry, BundleStorageError},
+            bundle_storage::{
+                BundleOrdering, BundleStorage, BundleStorageEntry, BundleStorageError, PruneStats,
+            },
         },
         packet_bundle::VerifiedPacketBundle,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
-        tip_manager::TipManager,
+        tip_manager::{TipManager, TipManagers},
     },
     agave_votor::slot_clock::SharedAlpenglowSlotClock,
     ahash::HashSet,
@@ -35,6 +38,7 @@ use {
         bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
         transaction_execution::TransactionStatusSender, vote_sender_types::ReplayVoteSender,
     },
+    solana_signature::{SIGNATURE_BYTES, Signature},
     solana_transaction::TransactionError,
     std::{
         collections::VecDeque,
@@ -90,6 +94,39 @@ pub struct BundleStageLoopMetrics {
     tip_programs_error: Saturating<u64>,
     bundle_lock_errors: Saturating<u64>,
     bundles_processed: Saturating<u64>,
+
+    // Where buffered bundles actually go. Every exit from the buffer used to be counted
+    // *except* the two that fire in practice: the `Forward` branch clears the whole buffer,
+    // and a failed execution destroys or retries the bundle. With 13 bundles received, 0
+    // processed and every drop counter reading 0, the buffer still drained — the evidence
+    // for why simply did not exist. These close that hole.
+    decision_consume: Saturating<u64>,
+    decision_forward: Saturating<u64>,
+    decision_hold: Saturating<u64>,
+    num_bundles_cleared_on_forward: Saturating<u64>,
+    num_bundles_error_retryable: Saturating<u64>,
+    num_bundles_error_non_retryable: Saturating<u64>,
+
+    // Bundles dropped at leader-slot entry by `BundleStorage::prune_stale`, before any lock or
+    // load was spent on them.
+    num_bundles_pruned_stale_blockhash: Saturating<u64>,
+    num_bundles_pruned_already_processed: Saturating<u64>,
+
+    // `num_bundles_dropped_packet_filter_error` split by which check failed. A searcher whose
+    // bundles all die at the filter is indistinguishable from any other drop without this.
+    num_bundles_dropped_pf_sanitization: Saturating<u64>,
+    num_bundles_dropped_pf_lock_validation: Saturating<u64>,
+    num_bundles_dropped_pf_compute_budget: Saturating<u64>,
+    num_bundles_dropped_pf_alt_resolution: Saturating<u64>,
+    num_bundles_dropped_pf_filter_key: Saturating<u64>,
+
+    // Which cost-model limit a bundle tripped. The bundle QoS path returns empty
+    // `TransactionErrorMetrics` on rejection, so these never reach the worker error metrics;
+    // this is the only place the limit is named.
+    num_bundles_cost_model_block_limit: Saturating<u64>,
+    num_bundles_cost_model_account_limit: Saturating<u64>,
+    num_bundles_cost_model_data_limit: Saturating<u64>,
+    num_bundles_cost_model_other: Saturating<u64>,
 }
 
 impl Default for BundleStageLoopMetrics {
@@ -115,6 +152,23 @@ impl Default for BundleStageLoopMetrics {
             tip_programs_error: Saturating(0),
             bundle_lock_errors: Saturating(0),
             bundles_processed: Saturating(0),
+            decision_consume: Saturating(0),
+            decision_forward: Saturating(0),
+            decision_hold: Saturating(0),
+            num_bundles_cleared_on_forward: Saturating(0),
+            num_bundles_error_retryable: Saturating(0),
+            num_bundles_error_non_retryable: Saturating(0),
+            num_bundles_pruned_stale_blockhash: Saturating(0),
+            num_bundles_pruned_already_processed: Saturating(0),
+            num_bundles_dropped_pf_sanitization: Saturating(0),
+            num_bundles_dropped_pf_lock_validation: Saturating(0),
+            num_bundles_dropped_pf_compute_budget: Saturating(0),
+            num_bundles_dropped_pf_alt_resolution: Saturating(0),
+            num_bundles_dropped_pf_filter_key: Saturating(0),
+            num_bundles_cost_model_block_limit: Saturating(0),
+            num_bundles_cost_model_account_limit: Saturating(0),
+            num_bundles_cost_model_data_limit: Saturating(0),
+            num_bundles_cost_model_other: Saturating(0),
         }
     }
 }
@@ -156,6 +210,69 @@ impl BundleStageLoopMetrics {
         self.bundles_processed += count;
     }
 
+    pub fn increment_decision_consume(&mut self) {
+        self.decision_consume += 1;
+    }
+
+    pub fn increment_decision_forward(&mut self) {
+        self.decision_forward += 1;
+    }
+
+    pub fn increment_decision_hold(&mut self) {
+        self.decision_hold += 1;
+    }
+
+    pub fn increment_bundles_cleared_on_forward(&mut self, count: u64) {
+        self.num_bundles_cleared_on_forward += count;
+    }
+
+    pub fn increment_bundle_error_retryable(&mut self) {
+        self.num_bundles_error_retryable += 1;
+    }
+
+    pub fn increment_bundle_error_non_retryable(&mut self) {
+        self.num_bundles_error_non_retryable += 1;
+    }
+
+    pub fn increment_bundles_pruned(&mut self, stats: PruneStats) {
+        self.num_bundles_pruned_stale_blockhash += stats.stale_blockhash;
+        self.num_bundles_pruned_already_processed += stats.already_processed;
+    }
+
+    /// Name the limit when the cost model refused a bundle. `BundleConsumer` marks the
+    /// offending transaction `NotCommitted(<limit error>)` and the rest `CommitCancelled`.
+    pub fn record_cost_model_reject(&mut self, output: &ProcessTransactionBatchOutput) {
+        if output.cost_model_throttled_transactions_count == 0 {
+            return;
+        }
+        let reason = output
+            .execute_and_commit_transactions_output
+            .commit_transactions_result
+            .as_ref()
+            .ok()
+            .and_then(|results| {
+                results.iter().find_map(|r| match r {
+                    CommitTransactionDetails::NotCommitted(TransactionError::CommitCancelled) => {
+                        None
+                    }
+                    CommitTransactionDetails::NotCommitted(err) => Some(err),
+                    _ => None,
+                })
+            });
+        match reason {
+            Some(TransactionError::WouldExceedMaxBlockCostLimit) => {
+                self.num_bundles_cost_model_block_limit += 1
+            }
+            Some(TransactionError::WouldExceedMaxAccountCostLimit) => {
+                self.num_bundles_cost_model_account_limit += 1
+            }
+            Some(TransactionError::WouldExceedAccountDataBlockLimit) => {
+                self.num_bundles_cost_model_data_limit += 1
+            }
+            _ => self.num_bundles_cost_model_other += 1,
+        }
+    }
+
     pub fn increment_bundle_dropped_error(&mut self, error: BundleStorageError) {
         self.num_bundles_dropped += 1;
         match error {
@@ -168,8 +285,23 @@ impl BundleStageLoopMetrics {
             BundleStorageError::PacketMarkedDiscard(_) => {
                 self.num_bundles_dropped_packet_marked_discard += 1;
             }
-            BundleStorageError::PacketFilterError(_) => {
+            BundleStorageError::PacketFilterError((err, _)) => {
                 self.num_bundles_dropped_packet_filter_error += 1;
+                match err {
+                    PacketHandlingError::Sanitization => {
+                        self.num_bundles_dropped_pf_sanitization += 1
+                    }
+                    PacketHandlingError::LockValidation => {
+                        self.num_bundles_dropped_pf_lock_validation += 1
+                    }
+                    PacketHandlingError::ComputeBudget => {
+                        self.num_bundles_dropped_pf_compute_budget += 1
+                    }
+                    PacketHandlingError::ALTResolution => {
+                        self.num_bundles_dropped_pf_alt_resolution += 1
+                    }
+                    PacketHandlingError::FilterKey => self.num_bundles_dropped_pf_filter_key += 1,
+                }
             }
             BundleStorageError::BundleTooLarge => {
                 self.num_bundles_dropped_bundle_too_large += 1;
@@ -271,6 +403,84 @@ impl BundleStageLoopMetrics {
                 ("tip_programs_error", self.tip_programs_error.0 as i64, i64),
                 ("bundle_lock_errors", self.bundle_lock_errors.0 as i64, i64),
                 ("bundles_processed", self.bundles_processed.0 as i64, i64),
+                (
+                    "cost_model_buffered_bundles_count",
+                    self.cost_model_buffered_bundles_count.0 as i64,
+                    i64
+                ),
+                ("decision_consume", self.decision_consume.0 as i64, i64),
+                ("decision_forward", self.decision_forward.0 as i64, i64),
+                ("decision_hold", self.decision_hold.0 as i64, i64),
+                (
+                    "num_bundles_cleared_on_forward",
+                    self.num_bundles_cleared_on_forward.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_error_retryable",
+                    self.num_bundles_error_retryable.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_error_non_retryable",
+                    self.num_bundles_error_non_retryable.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_pruned_stale_blockhash",
+                    self.num_bundles_pruned_stale_blockhash.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_pruned_already_processed",
+                    self.num_bundles_pruned_already_processed.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_dropped_pf_sanitization",
+                    self.num_bundles_dropped_pf_sanitization.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_dropped_pf_lock_validation",
+                    self.num_bundles_dropped_pf_lock_validation.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_dropped_pf_compute_budget",
+                    self.num_bundles_dropped_pf_compute_budget.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_dropped_pf_alt_resolution",
+                    self.num_bundles_dropped_pf_alt_resolution.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_dropped_pf_filter_key",
+                    self.num_bundles_dropped_pf_filter_key.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_cost_model_block_limit",
+                    self.num_bundles_cost_model_block_limit.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_cost_model_account_limit",
+                    self.num_bundles_cost_model_account_limit.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_cost_model_data_limit",
+                    self.num_bundles_cost_model_data_limit.0 as i64,
+                    i64
+                ),
+                (
+                    "num_bundles_cost_model_other",
+                    self.num_bundles_cost_model_other.0 as i64,
+                    i64
+                ),
             );
 
             self.last_report = Instant::now();
@@ -297,10 +507,33 @@ impl BundleStageLoopMetrics {
         self.tip_programs_error = Saturating(0);
         self.bundle_lock_errors = Saturating(0);
         self.bundles_processed = Saturating(0);
+        self.decision_consume = Saturating(0);
+        self.decision_forward = Saturating(0);
+        self.decision_hold = Saturating(0);
+        self.num_bundles_cleared_on_forward = Saturating(0);
+        self.num_bundles_error_retryable = Saturating(0);
+        self.num_bundles_error_non_retryable = Saturating(0);
+        self.num_bundles_pruned_stale_blockhash = Saturating(0);
+        self.num_bundles_pruned_already_processed = Saturating(0);
+        self.num_bundles_dropped_pf_sanitization = Saturating(0);
+        self.num_bundles_dropped_pf_lock_validation = Saturating(0);
+        self.num_bundles_dropped_pf_compute_budget = Saturating(0);
+        self.num_bundles_dropped_pf_alt_resolution = Saturating(0);
+        self.num_bundles_dropped_pf_filter_key = Saturating(0);
+        self.num_bundles_cost_model_block_limit = Saturating(0);
+        self.num_bundles_cost_model_account_limit = Saturating(0);
+        self.num_bundles_cost_model_data_limit = Saturating(0);
+        self.num_bundles_cost_model_other = Saturating(0);
     }
 
     pub fn has_data(&self) -> bool {
         self.num_bundles_received.0 > 0
+            || self.num_bundles_pruned_stale_blockhash.0 > 0
+            || self.num_bundles_pruned_already_processed.0 > 0
+            || self.num_bundles_cost_model_block_limit.0 > 0
+            || self.num_bundles_cost_model_account_limit.0 > 0
+            || self.num_bundles_cost_model_data_limit.0 > 0
+            || self.num_bundles_cost_model_other.0 > 0
             || self.num_packets_received.0 > 0
             || self.newly_buffered_bundles_count.0 > 0
             || self.current_buffered_bundles_count.0 > 0
@@ -316,6 +549,9 @@ impl BundleStageLoopMetrics {
             || self.tip_programs_error.0 > 0
             || self.bundle_lock_errors.0 > 0
             || self.bundles_processed.0 > 0
+            || self.num_bundles_cleared_on_forward.0 > 0
+            || self.num_bundles_error_retryable.0 > 0
+            || self.num_bundles_error_non_retryable.0 > 0
     }
 }
 
@@ -346,7 +582,7 @@ impl BundleStage {
         replay_vote_sender: ReplayVoteSender,
         log_messages_bytes_limit: Option<usize>,
         exit: Arc<AtomicBool>,
-        tip_manager: TipManager,
+        tip_managers: TipManagers,
         bundle_account_locker: BundleAccountLocker,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         bam_enabled: Arc<AtomicU8>,
@@ -364,7 +600,7 @@ impl BundleStage {
             replay_vote_sender,
             log_messages_bytes_limit,
             exit,
-            tip_manager,
+            tip_managers,
             bundle_account_locker,
             block_builder_fee_info,
             bam_enabled,
@@ -389,7 +625,7 @@ impl BundleStage {
         replay_vote_sender: ReplayVoteSender,
         log_message_bytes_limit: Option<usize>,
         exit: Arc<AtomicBool>,
-        tip_manager: TipManager,
+        tip_managers: TipManagers,
         bundle_account_locker: BundleAccountLocker,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         bam_enabled: Arc<AtomicU8>,
@@ -424,7 +660,7 @@ impl BundleStage {
                     exit,
                     blacklisted_accounts,
                     bundle_account_locker,
-                    tip_manager,
+                    tip_managers,
                     block_builder_fee_info,
                     bam_enabled,
                     cluster_info,
@@ -444,13 +680,16 @@ impl BundleStage {
         exit: Arc<AtomicBool>,
         blacklisted_accounts: HashSet<Pubkey>,
         bundle_account_locker: BundleAccountLocker,
-        tip_manager: TipManager,
+        tip_managers: TipManagers,
         block_builder_fee_info: Arc<ArcSwap<BlockBuilderFeeInfo>>,
         bam_enabled: Arc<AtomicU8>,
         cluster_info: Arc<ClusterInfo>,
     ) {
         let mut last_metrics_update = Instant::now();
-        let mut bundle_storage = BundleStorage::with_capacity(2_000);
+        let ordering = BundleOrdering::from_env();
+        info!("bundle stage ordering: {ordering:?}");
+        let mut bundle_storage =
+            BundleStorage::with_ordering(2_000, ordering, tip_managers.get_tip_accounts().clone());
 
         let mut bundle_stage_metrics = BundleStageLoopMetrics::default();
         let consume_worker_metrics = ConsumeWorkerMetrics::new(10_000);
@@ -473,7 +712,7 @@ impl BundleStage {
                         &mut bundle_stage_metrics,
                         &mut last_tip_update_slot,
                         &block_builder_fee_info,
-                        &tip_manager,
+                        &tip_managers,
                         &cluster_info,
                         &consume_worker_metrics
                     ));
@@ -558,6 +797,12 @@ impl BundleStage {
             bundle_stage_metrics.increment_num_bundles_received(1);
             bundle_stage_metrics.increment_num_packets_received(num_packets as u64);
 
+            // The bundle is consumed by the insert, so read the leading signature now; it is
+            // only needed to name a dropped bundle in the debug log.
+            let first_signature = log::log_enabled!(log::Level::Debug)
+                .then(|| Self::first_signature(&bundle))
+                .flatten();
+
             match bundle_storage.insert_bundle(
                 bundle,
                 &root_bank,
@@ -568,12 +813,26 @@ impl BundleStage {
                     bundle_stage_metrics.increment_newly_buffered_bundles_count(1);
                 }
                 Err(e) => {
+                    if let BundleStorageError::PacketFilterError((err, idx)) = &e {
+                        debug!(
+                            "bundle dropped by packet filter: {err:?} at packet {idx}, first \
+                             signature {first_signature:?}"
+                        );
+                    }
                     bundle_stage_metrics.increment_bundle_dropped_error(e);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// The first signature of the bundle's first packet, read straight off the wire bytes
+    /// (1-byte signature count, then the signatures). `None` if the packet is too short.
+    fn first_signature(bundle: &VerifiedPacketBundle) -> Option<Signature> {
+        let packet = bundle.batch().iter().next()?;
+        let bytes = packet.data(1..1 + SIGNATURE_BYTES)?;
+        Signature::try_from(bytes).ok()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -585,7 +844,7 @@ impl BundleStage {
         bundle_stage_metrics: &mut BundleStageLoopMetrics,
         last_tip_update_slot: &mut Slot,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
-        tip_manager: &TipManager,
+        tip_managers: &TipManagers,
         cluster_info: &Arc<ClusterInfo>,
         consume_worker_metrics: &ConsumeWorkerMetrics,
     ) {
@@ -593,6 +852,7 @@ impl BundleStage {
             // BufferedPacketsDecision::Consume means this leader is scheduled to be running at the moment.
             // Execute, record, and commit as many bundles possible given time, compute, and other constraints.
             BufferedPacketsDecision::Consume(bank) => {
+                bundle_stage_metrics.increment_decision_consume();
                 Self::consume_bundles(
                     &bank,
                     bundle_storage,
@@ -601,7 +861,7 @@ impl BundleStage {
                     bundle_stage_metrics,
                     last_tip_update_slot,
                     block_builder_fee_info,
-                    tip_manager,
+                    tip_managers,
                     cluster_info,
                     consume_worker_metrics,
                 );
@@ -609,12 +869,23 @@ impl BundleStage {
             // BufferedPacketsDecision::Forward means the leader is slot is far away.
             // Bundles aren't forwarded because it breaks atomicity guarantees, so just drop them.
             BufferedPacketsDecision::Forward => {
+                // Silently discarding a buffered bundle here is by design (forwarding one
+                // would break atomicity), but it is indistinguishable from "we executed it"
+                // unless it is counted — this branch is the buffer's busiest exit.
+                bundle_stage_metrics.increment_decision_forward();
+                bundle_stage_metrics.increment_bundles_cleared_on_forward(
+                    (bundle_storage.unprocessed_bundles_len()
+                        + bundle_storage.cost_model_buffered_bundles_len())
+                        as u64,
+                );
                 bundle_storage.clear();
             }
             // BufferedPacketsDecision::ForwardAndHold | BufferedPacketsDecision::Hold means the validator
             // is approaching the leader slot, hold bundles. Also, bundles aren't forwarded because it breaks
             // atomicity guarantees
-            BufferedPacketsDecision::ForwardAndHold | BufferedPacketsDecision::Hold => {}
+            BufferedPacketsDecision::ForwardAndHold | BufferedPacketsDecision::Hold => {
+                bundle_stage_metrics.increment_decision_hold();
+            }
         }
     }
 
@@ -627,7 +898,7 @@ impl BundleStage {
         bundle_stage_metrics: &mut BundleStageLoopMetrics,
         last_tip_update_slot: &mut Slot,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
-        tip_manager: &TipManager,
+        tip_managers: &TipManagers,
         cluster_info: &Arc<ClusterInfo>,
         consume_worker_metrics: &ConsumeWorkerMetrics,
     ) {
@@ -636,33 +907,27 @@ impl BundleStage {
         let mut bundles = VecDeque::with_capacity(BUNDLE_WINDOW_SIZE.get());
 
         if bank.slot() != *last_tip_update_slot {
-            match Self::handle_tip_programs(
+            let failures = Self::handle_tip_programs(
                 bank,
                 bundle_account_locker,
                 consumer,
-                tip_manager,
+                tip_managers,
                 cluster_info,
                 block_builder_fee_info,
                 consume_worker_metrics,
-            ) {
-                Ok(()) => {
-                    *last_tip_update_slot = bank.slot();
-                }
-                Err(BundleExecutionError::ErrorRetryable) => {
-                    bundle_stage_metrics.increment_tip_programs_error(1);
-                    error!("tip programs error, not processing bundles");
-                    return;
-                }
-                Err(err) => {
-                    // Instruction failures and missing accounts will not succeed on retry
-                    // in this slot. Advance so we do not tight-loop every 10ms poll.
-                    bundle_stage_metrics.increment_tip_programs_error(1);
-                    error!("tip programs error, not processing bundles: {err:?}");
-                    *last_tip_update_slot = bank.slot();
-                    return;
-                }
+            );
+            if failures > 0 {
+                bundle_stage_metrics.increment_tip_programs_error(failures as u64);
+                // Do NOT return — tip programs may not exist on devnet/testnet, and an
+                // upstream program we cannot crank must not stop us building the block.
+                // Bundles are still valid and should be processed.
             }
+
+            *last_tip_update_slot = bank.slot();
         }
+
+        // Clear out what this bank would reject anyway, so the window opens on live bundles.
+        bundle_stage_metrics.increment_bundles_pruned(bundle_storage.prune_stale(bank));
 
         // This loop shall:
         // - Pop a bundle from the bundle storage
@@ -701,7 +966,13 @@ impl BundleStage {
             let Some(bundle) = bundles.pop_front() else {
                 break;
             };
-            let result = Self::process_bundle(bank, &bundle, consumer, consume_worker_metrics);
+            let result = Self::process_bundle(
+                bank,
+                &bundle,
+                consumer,
+                consume_worker_metrics,
+                bundle_stage_metrics,
+            );
             let _ = bundle_account_locker.unlock_bundle(&bundle.transactions, bank);
             match result {
                 Ok(output) => {
@@ -711,9 +982,17 @@ impl BundleStage {
                     bundle_storage.destroy_bundle(bundle);
                 }
                 Err(BundleExecutionError::ErrorRetryable) => {
+                    bundle_stage_metrics.increment_bundle_error_retryable();
+                    // `set_has_data` gates the whole ConsumeWorkerMetrics report, and only the
+                    // success path set it — so the per-TransactionError breakdown that names
+                    // *why* a bundle failed was collected and then thrown away. A failed
+                    // bundle is exactly when we need it.
+                    consume_worker_metrics.set_has_data(true);
                     bundle_storage.retry_bundle(bundle);
                 }
                 Err(BundleExecutionError::ErrorNonRetryable) => {
+                    bundle_stage_metrics.increment_bundle_error_non_retryable();
+                    consume_worker_metrics.set_has_data(true);
                     bundle_storage.destroy_bundle(bundle);
                 }
                 Err(BundleExecutionError::TipError) => {
@@ -744,42 +1023,92 @@ impl BundleStage {
         bank: &Arc<Bank>,
         bundle_account_locker: &BundleAccountLocker,
         consumer: &mut BundleConsumer,
-        tip_manager: &TipManager,
+        tip_managers: &TipManagers,
         cluster_info: &Arc<ClusterInfo>,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         consume_worker_metrics: &ConsumeWorkerMetrics,
-    ) -> BundleExecutionResult<()> {
+    ) -> usize {
         // Tip programs fund PDAs with Rent::get().minimum_balance(). When rent is
         // free (local-cluster), that is 0 lamports and accounts-db drops the
         // accounts, so init/crank can never succeed. Skip instead of retrying
         // doomed work every poll.
         if bank.rent_collector().rent.minimum_balance(0) == 0 {
             debug!("skipping tip program init/crank because rent is free");
-            return Ok(());
+            return 0;
+        }
+        let keypair = cluster_info.keypair();
+        let bb_info = block_builder_fee_info.load();
+        let mut failures = 0usize;
+
+        // Programs are cranked independently: a program we cannot crank (wrong config, an
+        // upstream program we do not fully control) must not stop us cranking the others.
+        for tip_manager in tip_managers.iter() {
+            let program = tip_manager.tip_payment_program_id();
+
+            if let Err(e) = Self::handle_initialize_tip_programs(
+                bank,
+                bundle_account_locker,
+                consumer,
+                tip_manager,
+                consume_worker_metrics,
+                &keypair,
+            ) {
+                warn!("tip program {program} initialize failed: {e:?}");
+                failures += 1;
+                continue;
+            }
+
+            let steps = match tip_manager.get_crank_steps(bank, &keypair, &bb_info) {
+                Ok(steps) => steps,
+                Err(e) => {
+                    warn!("tip program {program} crank could not be built: {e:?}");
+                    failures += 1;
+                    continue;
+                }
+            };
+
+            for step in steps {
+                let _ = bundle_account_locker.lock_bundle(&step.txs, bank);
+                let max_ages: SmallVec<[MaxAge; 2]> = SmallVec::from_elem(
+                    MaxAge {
+                        sanitized_epoch: bank.epoch(),
+                        alt_invalidation_slot: bank.slot(),
+                    },
+                    step.txs.len(),
+                );
+                let output = consumer.process_and_record_aged_transactions(
+                    bank,
+                    &step.txs,
+                    &max_ages,
+                    MAX_BUNDLE_RETRY_DURATION,
+                );
+                let _ = bundle_account_locker.unlock_bundle(&step.txs, bank);
+                consume_worker_metrics.update_for_consume(&output);
+                consume_worker_metrics.set_has_data(true);
+
+                match Self::to_bundle_result(&output) {
+                    Ok(()) => debug!("tip program {program} crank step {} ok", step.label),
+                    Err(e) => {
+                        // The enum alone hides which transaction error actually fired, so
+                        // surface the commit results too — this is the only place they exist.
+                        warn!(
+                            "tip program {program} crank step {} failed: {e:?} results={:?}",
+                            step.label,
+                            output
+                                .execute_and_commit_transactions_output
+                                .commit_transactions_result
+                        );
+                        failures += 1;
+                        if step.blocking {
+                            // Later steps read what this one was supposed to write.
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
-        let keypair = cluster_info.keypair();
-
-        Self::handle_initialize_tip_programs(
-            bank,
-            bundle_account_locker,
-            consumer,
-            tip_manager,
-            consume_worker_metrics,
-            &keypair,
-        )?;
-
-        Self::handle_crank_tip_programs(
-            bank,
-            bundle_account_locker,
-            consumer,
-            tip_manager,
-            block_builder_fee_info,
-            consume_worker_metrics,
-            &keypair,
-        )?;
-
-        Ok(())
+        failures
     }
 
     fn handle_initialize_tip_programs(
@@ -832,59 +1161,6 @@ impl BundleStage {
         bundle_result
     }
 
-    fn handle_crank_tip_programs(
-        bank: &Arc<Bank>,
-        bundle_account_locker: &BundleAccountLocker,
-        consumer: &mut BundleConsumer,
-        tip_manager: &TipManager,
-        block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
-        consume_worker_metrics: &ConsumeWorkerMetrics,
-        keypair: &Keypair,
-    ) -> BundleExecutionResult<()> {
-        let block_builder_fee_info = block_builder_fee_info.load();
-        if block_builder_fee_info.block_builder == Pubkey::default() {
-            return Err(BundleExecutionError::ErrorRetryable);
-        }
-        let crank_tip_program_transactions = tip_manager
-            .get_tip_programs_crank_bundle(bank, keypair, &block_builder_fee_info)
-            .map_err(|e| {
-                warn!("tip programs crank error: {e:?}");
-                BundleExecutionError::TipError
-            })?;
-
-        if crank_tip_program_transactions.is_empty() {
-            return Ok(());
-        }
-
-        let max_age = MaxAge {
-            sanitized_epoch: bank.epoch(),
-            alt_invalidation_slot: bank.slot(),
-        };
-        // SmallVec 2: tip-manager crank bundle is at most init-distribution + change-receiver txs.
-        let max_ages: SmallVec<[MaxAge; 2]> =
-            SmallVec::from_elem(max_age, crank_tip_program_transactions.len());
-        let _ = bundle_account_locker.lock_bundle(&crank_tip_program_transactions, bank);
-        let output = consumer.process_and_record_aged_transactions(
-            bank,
-            &crank_tip_program_transactions,
-            &max_ages,
-            MAX_BUNDLE_RETRY_DURATION,
-        );
-        let _ = bundle_account_locker.unlock_bundle(&crank_tip_program_transactions, bank);
-
-        consume_worker_metrics.update_for_consume(&output);
-        consume_worker_metrics.set_has_data(true);
-        let bundle_result = Self::to_bundle_result(&output);
-        debug!(
-            "crank tip program output: {:?}",
-            output
-                .execute_and_commit_transactions_output
-                .commit_transactions_result
-        );
-        info!("crank tip program output: {bundle_result:?}");
-        bundle_result
-    }
-
     fn to_bundle_result(output: &ProcessTransactionBatchOutput) -> BundleExecutionResult<()> {
         // If the commit transactions result is ok and all the commit transactions results are committed without an error, return ok.
         if output
@@ -930,6 +1206,7 @@ impl BundleStage {
         bundle: &BundleStorageEntry,
         consumer: &mut BundleConsumer,
         consume_worker_metrics: &ConsumeWorkerMetrics,
+        bundle_stage_metrics: &mut BundleStageLoopMetrics,
     ) -> BundleExecutionResult<ProcessTransactionBatchOutput> {
         if bank.is_complete() {
             return Err(BundleExecutionError::ErrorRetryable);
@@ -943,6 +1220,7 @@ impl BundleStage {
         );
 
         consume_worker_metrics.update_for_consume(&output);
+        bundle_stage_metrics.record_cost_model_reject(&output);
 
         let result = Self::to_bundle_result(&output);
 
@@ -978,6 +1256,13 @@ mod tests {
             tip_distribution::{JitoTipDistributionConfig, TipDistributionAccount},
             tip_payment::JitoTipPaymentConfig,
         },
+        crate::{
+            banking_stage::{
+                consumer::{ExecuteAndCommitTransactionsOutput, LeaderProcessedTransactionCounts},
+                leader_slot_timing_metrics::LeaderExecuteAndCommitTimings,
+            },
+            bundle_stage::bundle_storage::BundleStorageError,
+        },
         agave_feature_set::FeatureSet,
         crossbeam_channel::{bounded, unbounded},
         solana_cluster_type::ClusterType,
@@ -1001,16 +1286,15 @@ mod tests {
         solana_program_binaries::{jito_tip_distribution, jito_tip_payment, spl_programs},
         solana_rent::Rent,
         solana_runtime::genesis_utils::create_genesis_config_with_leader_ex,
-        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_signer::Signer,
         solana_svm::{
             transaction_commit_result::TransactionCommitResultExtensions,
+            transaction_error_metrics::TransactionErrorMetrics,
             transaction_processor::ExecutionRecordingConfig,
         },
         solana_svm_timings::ExecuteTimings,
         solana_system_transaction::transfer,
         solana_time_utils::timestamp,
-        solana_transaction::sanitized::SanitizedTransaction,
         solana_vote_interface::state::vote_state_v4::VoteStateV4,
     };
 
@@ -1068,6 +1352,23 @@ mod tests {
         }
     }
 
+    fn cost_model_output(
+        results: Vec<CommitTransactionDetails>,
+        throttled: u64,
+    ) -> ProcessTransactionBatchOutput {
+        ProcessTransactionBatchOutput {
+            cost_model_throttled_transactions_count: throttled,
+            cost_model_us: 0,
+            execute_and_commit_transactions_output: ExecuteAndCommitTransactionsOutput {
+                transaction_counts: LeaderProcessedTransactionCounts::default(),
+                retryable_transaction_indexes: vec![],
+                commit_transactions_result: Ok(results),
+                execute_and_commit_timings: LeaderExecuteAndCommitTimings::default(),
+                error_counters: TransactionErrorMetrics::default(),
+            },
+        }
+    }
+
     fn execute_tip_program_maintenance(
         bank: &Bank,
         leader_keypair: &Keypair,
@@ -1075,7 +1376,7 @@ mod tests {
     ) -> (
         bool,
         bool,
-        crate::tip_manager::Result<SmallVec<[RuntimeTransaction<SanitizedTransaction>; 2]>>,
+        crate::tip_manager::Result<Vec<crate::tip_manager::CrankStep>>,
     ) {
         let tip_manager = TipManager::new(TipManagerConfig {
             tip_payment_program_id: Pubkey::from(jito_tip_payment::id().to_bytes()),
@@ -1104,7 +1405,7 @@ mod tests {
         let config_account_exists = bank
             .get_account(&tip_manager.tip_payment_config_pubkey())
             .is_some();
-        let crank = tip_manager.get_tip_programs_crank_bundle(
+        let crank = tip_manager.get_crank_steps(
             bank,
             leader_keypair,
             &BlockBuilderFeeInfo {
@@ -1169,7 +1470,7 @@ mod tests {
                 &mut metrics,
                 &mut last_tip_update_slot,
                 &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo::default())),
-                &TipManager::new(TipManagerConfig::default()),
+                &TipManagers::new(vec![TipManagerConfig::default()]),
                 &cluster_info,
                 &ConsumeWorkerMetrics::new(10_000),
             );
@@ -1182,25 +1483,91 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_block_builder_fee_info_is_retryable() {
-        let bank = Arc::new(Bank::new_for_tests(&GenesisConfig::default()));
-        let (record_sender, _record_receiver) = solana_poh::record_channels::record_channels(false);
-        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
-        let committer = Committer::new(None, replay_vote_sender, None);
-        let mut consumer =
-            BundleConsumer::new(committer, TransactionRecorder::new(record_sender), None);
+    fn test_packet_filter_drops_are_counted_by_variant() {
+        let mut metrics = BundleStageLoopMetrics::default();
+        for (err, idx) in [
+            (PacketHandlingError::Sanitization, 0),
+            (PacketHandlingError::FilterKey, 1),
+            (PacketHandlingError::FilterKey, 2),
+        ] {
+            metrics
+                .increment_bundle_dropped_error(BundleStorageError::PacketFilterError((err, idx)));
+        }
+        assert_eq!(metrics.num_bundles_dropped.0, 3);
+        assert_eq!(metrics.num_bundles_dropped_packet_filter_error.0, 3);
+        assert_eq!(metrics.num_bundles_dropped_pf_sanitization.0, 1);
+        assert_eq!(metrics.num_bundles_dropped_pf_filter_key.0, 2);
+        assert_eq!(metrics.num_bundles_dropped_pf_lock_validation.0, 0);
+        assert_eq!(metrics.num_bundles_dropped_pf_compute_budget.0, 0);
+        assert_eq!(metrics.num_bundles_dropped_pf_alt_resolution.0, 0);
+    }
 
-        let result = BundleStage::handle_crank_tip_programs(
-            &bank,
-            &BundleAccountLocker::default(),
-            &mut consumer,
-            &TipManager::new(TipManagerConfig::default()),
-            &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo::default())),
-            &ConsumeWorkerMetrics::new(10_000),
-            &Keypair::new(),
+    #[test]
+    fn test_cost_model_reject_names_the_limit() {
+        let mut metrics = BundleStageLoopMetrics::default();
+
+        // Not throttled: nothing is recorded, whatever the commit results say.
+        metrics.record_cost_model_reject(&cost_model_output(
+            vec![CommitTransactionDetails::NotCommitted(
+                TransactionError::WouldExceedMaxBlockCostLimit,
+            )],
+            0,
+        ));
+        assert_eq!(metrics.num_bundles_cost_model_block_limit.0, 0);
+
+        // The offending transaction is named; the rest of the bundle is CommitCancelled.
+        metrics.record_cost_model_reject(&cost_model_output(
+            vec![
+                CommitTransactionDetails::NotCommitted(TransactionError::CommitCancelled),
+                CommitTransactionDetails::NotCommitted(
+                    TransactionError::WouldExceedMaxAccountCostLimit,
+                ),
+                CommitTransactionDetails::NotCommitted(TransactionError::CommitCancelled),
+            ],
+            3,
+        ));
+        assert_eq!(metrics.num_bundles_cost_model_account_limit.0, 1);
+
+        metrics.record_cost_model_reject(&cost_model_output(
+            vec![CommitTransactionDetails::NotCommitted(
+                TransactionError::WouldExceedMaxBlockCostLimit,
+            )],
+            1,
+        ));
+        assert_eq!(metrics.num_bundles_cost_model_block_limit.0, 1);
+
+        metrics.record_cost_model_reject(&cost_model_output(
+            vec![CommitTransactionDetails::NotCommitted(
+                TransactionError::WouldExceedAccountDataBlockLimit,
+            )],
+            1,
+        ));
+        assert_eq!(metrics.num_bundles_cost_model_data_limit.0, 1);
+
+        // Throttled with no named limit in the results: counted, not lost.
+        metrics.record_cost_model_reject(&cost_model_output(
+            vec![CommitTransactionDetails::NotCommitted(
+                TransactionError::CommitCancelled,
+            )],
+            1,
+        ));
+        assert_eq!(metrics.num_bundles_cost_model_other.0, 1);
+        assert_eq!(metrics.num_bundles_cost_model_block_limit.0, 1);
+        assert_eq!(metrics.num_bundles_cost_model_account_limit.0, 1);
+    }
+
+    #[test]
+    fn test_first_signature_reads_the_wire_bytes() {
+        let tx = test_tx();
+        let packet = BytesPacket::from_data(tx.clone()).unwrap();
+        let bundle = VerifiedPacketBundle::new(PacketBatch::from(vec![packet]));
+        assert_eq!(
+            BundleStage::first_signature(&bundle),
+            Some(tx.signatures[0])
         );
 
-        assert_matches!(result, Err(BundleExecutionError::ErrorRetryable));
+        let empty = VerifiedPacketBundle::new(PacketBatch::from(vec![]));
+        assert_eq!(BundleStage::first_signature(&empty), None);
     }
 
     #[test]
@@ -1303,7 +1670,8 @@ mod tests {
                 crank,
                 Err(crate::tip_manager::TipManagerError::AccountMissing)
             ),
-            "crank must fail after the config PDA is dropped: {crank:?}"
+            "crank must fail after the config PDA is dropped: {:?}",
+            crank.as_ref().map(|steps| steps.iter().map(|step| step.label).collect::<Vec<_>>())
         );
     }
 
@@ -1332,7 +1700,8 @@ mod tests {
         );
         assert!(
             crank.is_ok(),
-            "crank should build after a persisted init: {crank:?}"
+            "crank should build after a persisted init: {:?}",
+            crank.as_ref().map(|steps| steps.iter().map(|step| step.label).collect::<Vec<_>>())
         );
     }
 
@@ -1386,7 +1755,7 @@ mod tests {
             replay_vote_sender,
             None,
             exit.clone(),
-            TipManager::new(TipManagerConfig {
+            TipManagers::new(vec![TipManagerConfig {
                 tip_payment_program_id: Pubkey::from(jito_tip_payment::id().to_bytes()),
                 tip_distribution_program_id: Pubkey::from(jito_tip_distribution::id().to_bytes()),
                 tip_distribution_account_config: TipDistributionAccountConfig {
@@ -1394,7 +1763,7 @@ mod tests {
                     vote_account: genesis_config_info.voting_keypair.pubkey(),
                     commission_bps: 10,
                 },
-            }),
+            }]),
             BundleAccountLocker::default(),
             &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                 block_builder: genesis_config_info.validator_pubkey,
@@ -1408,8 +1777,9 @@ mod tests {
         // initialize tip distribution config
         // initialize tip payment config
         // initialize tip distribution account
-        // change tip receiver and block builder
-        const NUM_TXS_EXPECTED: usize = 4;
+        // change tip receiver
+        // change block builder
+        const NUM_TXS_EXPECTED: usize = 5;
         let mut tx_count = 0;
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(2) {
@@ -1526,7 +1896,7 @@ mod tests {
             replay_vote_sender,
             None,
             exit.clone(),
-            TipManager::new(TipManagerConfig {
+            TipManagers::new(vec![TipManagerConfig {
                 tip_payment_program_id: Pubkey::from(jito_tip_payment::id().to_bytes()),
                 tip_distribution_program_id: Pubkey::from(jito_tip_distribution::id().to_bytes()),
                 tip_distribution_account_config: TipDistributionAccountConfig {
@@ -1534,7 +1904,7 @@ mod tests {
                     vote_account: genesis_config_info.voting_keypair.pubkey(),
                     commission_bps: 10,
                 },
-            }),
+            }]),
             BundleAccountLocker::default(),
             &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                 block_builder: genesis_config_info.validator_pubkey,
@@ -1551,7 +1921,7 @@ mod tests {
         verified_bundle_sender.send(verified_bundle).unwrap();
 
         let start = Instant::now();
-        const MAX_EXPECTED_TXS: usize = 4;
+        const MAX_EXPECTED_TXS: usize = 5;
         let mut tx_count = 0;
         while start.elapsed() < Duration::from_secs(2) {
             if let Ok((_bank, (RecorderMessage::Entry(entry), _tick_height))) =
@@ -1618,7 +1988,7 @@ mod tests {
             replay_vote_sender,
             None,
             exit.clone(),
-            TipManager::new(TipManagerConfig {
+            TipManagers::new(vec![TipManagerConfig {
                 tip_payment_program_id: Pubkey::from(jito_tip_payment::id().to_bytes()),
                 tip_distribution_program_id: Pubkey::from(jito_tip_distribution::id().to_bytes()),
                 tip_distribution_account_config: TipDistributionAccountConfig {
@@ -1626,7 +1996,7 @@ mod tests {
                     vote_account: genesis_config_info.voting_keypair.pubkey(),
                     commission_bps: 10,
                 },
-            }),
+            }]),
             BundleAccountLocker::default(),
             &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                 block_builder: genesis_config_info.validator_pubkey,
@@ -1661,7 +2031,7 @@ mod tests {
 
         let start = Instant::now();
         const PROCESSING_TIMEOUT: Duration = Duration::from_secs(10);
-        const MAX_EXPECTED_TXS: usize = 6; // 4 initial for tips + 2 transfers
+        const MAX_EXPECTED_TXS: usize = 7; // 5 initial for tips + 2 transfers
         let expected_balance = genesis_config_info.genesis_config.rent.minimum_balance(0);
         let mut tx_count = 0;
         while (tx_count < MAX_EXPECTED_TXS || bank.get_balance(&kp2.pubkey()) != expected_balance)
@@ -1736,7 +2106,7 @@ mod tests {
             replay_vote_sender,
             None,
             exit.clone(),
-            TipManager::new(TipManagerConfig {
+            TipManagers::new(vec![TipManagerConfig {
                 tip_payment_program_id: Pubkey::from(jito_tip_payment::id().to_bytes()),
                 tip_distribution_program_id: Pubkey::from(jito_tip_distribution::id().to_bytes()),
                 tip_distribution_account_config: TipDistributionAccountConfig {
@@ -1744,7 +2114,7 @@ mod tests {
                     vote_account: genesis_config_info.voting_keypair.pubkey(),
                     commission_bps: 10,
                 },
-            }),
+            }]),
             BundleAccountLocker::default(),
             &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                 block_builder: genesis_config_info.validator_pubkey,
@@ -1786,7 +2156,7 @@ mod tests {
         verified_bundle_sender.send(verified_bundle).unwrap();
 
         let start = Instant::now();
-        const MAX_EXPECTED_TXS: usize = 4; // 4 initial for tips
+        const MAX_EXPECTED_TXS: usize = 5; // 5 initial for tips
         let mut tx_count = 0;
         while start.elapsed() < Duration::from_secs(2) {
             if let Ok((_bank, (RecorderMessage::Entry(entry), _tick_height))) =
@@ -1853,7 +2223,7 @@ mod tests {
             replay_vote_sender,
             None,
             exit.clone(),
-            TipManager::new(TipManagerConfig {
+            TipManagers::new(vec![TipManagerConfig {
                 tip_payment_program_id: Pubkey::from(jito_tip_payment::id().to_bytes()),
                 tip_distribution_program_id: Pubkey::from(jito_tip_distribution::id().to_bytes()),
                 tip_distribution_account_config: TipDistributionAccountConfig {
@@ -1861,7 +2231,7 @@ mod tests {
                     vote_account: genesis_config_info.voting_keypair.pubkey(),
                     commission_bps: 10,
                 },
-            }),
+            }]),
             BundleAccountLocker::default(),
             &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                 block_builder: genesis_config_info.validator_pubkey,
@@ -1887,7 +2257,7 @@ mod tests {
         verified_bundle_sender.send(verified_bundle).unwrap();
 
         let start = Instant::now();
-        const MAX_EXPECTED_TXS: usize = 5; // 4 initial for tips
+        const MAX_EXPECTED_TXS: usize = 6; // 5 initial for tips + 1
         let mut tx_count = 0;
         while start.elapsed() < Duration::from_secs(2) {
             if let Ok((_bank, (RecorderMessage::Entry(entry), _tick_height))) =

@@ -211,7 +211,7 @@ impl LocalCluster {
         identity: &Pubkey,
         vote_account: &Pubkey,
     ) {
-        config.tip_manager_config = TipManagerConfig {
+        config.tip_manager_configs = vec![TipManagerConfig {
             tip_payment_program_id: jito_tip_payment::id(),
             tip_distribution_program_id: jito_tip_distribution::id(),
             tip_distribution_account_config: TipDistributionAccountConfig {
@@ -219,7 +219,7 @@ impl LocalCluster {
                 vote_account: *vote_account,
                 commission_bps: 10,
             },
-        };
+        }];
     }
 
     pub fn new(config: &mut ClusterConfig, socket_addr_space: SocketAddrSpace) -> Self {
