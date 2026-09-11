@@ -65,6 +65,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         no_wait_for_vote_to_start_leader: config.no_wait_for_vote_to_start_leader,
         accounts_db_config: config.accounts_db_config.clone(),
         wait_to_vote_slot: config.wait_to_vote_slot,
+        duplicate_slot_repair_bypass: config.duplicate_slot_repair_bypass,
         runtime_config: config.runtime_config.clone(),
         banking_trace_dir_byte_limit: config.banking_trace_dir_byte_limit,
         block_verification_method: config.block_verification_method.clone(),
@@ -91,7 +92,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         shred_receiver_addresses: config.shred_receiver_addresses.clone(),
         shred_retransmit_receiver_addresses: config.shred_retransmit_receiver_addresses.clone(),
         multicast_receiver_address: config.multicast_receiver_address.clone(),
-        tip_manager_config: config.tip_manager_config.clone(),
+        tip_manager_configs: config.tip_manager_configs.clone(),
         bam_url: config.bam_url.clone(),
         disable_multicast_shred_check: config.disable_multicast_shred_check,
     }

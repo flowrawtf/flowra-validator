@@ -30,7 +30,7 @@ use {
         },
         sigverify_stage::SigVerifyStage,
         staked_nodes_updater_service::StakedNodesUpdaterService,
-        tip_manager::{TipManager, TipManagerConfig},
+        tip_manager::{TipManagerConfig, TipManagers},
         tpu_entry_notifier::TpuEntryNotifier,
         validator::{BlockProductionMethod, GeneratorConfig},
     },
@@ -188,7 +188,7 @@ impl Tpu {
         votor_event_sender: VotorEventSender,
         block_engine_config: Arc<ArcSwap<BlockEngineConfig>>,
         relayer_config: Arc<ArcSwap<RelayerConfig>>,
-        tip_manager_config: TipManagerConfig,
+        tip_manager_configs: Vec<TipManagerConfig>,
         shredstream_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
         shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
         bam_shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
@@ -409,10 +409,17 @@ impl Tpu {
 
         let bundle_account_locker = BundleAccountLocker::default();
 
-        let tip_manager = TipManager::new(tip_manager_config);
+        let tip_managers = TipManagers::new(tip_manager_configs);
+        // FLOWRA PoC: expose the tip-payment PDAs to the scheduler's optional
+        // tip-aware priority calculation (`FLOWRA_TIP_AWARE_PRIORITY=1`).
+        crate::transaction_priority::set_tip_accounts(
+            tip_managers.get_tip_accounts().iter().copied(),
+        );
         let filter_keys = {
             let mut filter_keys = filter_keys.as_ref().clone();
-            filter_keys.insert(tip_manager.tip_payment_program_id());
+            for tip_manager in tip_managers.iter() {
+                filter_keys.insert(tip_manager.tip_payment_program_id());
+            }
             Arc::new(filter_keys)
         };
         let (bam_batch_sender, bam_batch_receiver) = bounded(100_000);
@@ -453,7 +460,7 @@ impl Tpu {
             scheduler_priority_floor,
             bundle_account_locker.clone(),
             Some(TipProcessingDependencies {
-                tip_manager: tip_manager.clone(),
+                tip_managers: tip_managers.clone(),
                 block_builder_fee_info: block_builder_fee_info.clone(),
                 cluster_info: cluster_info.clone(),
                 bundle_account_locker: bundle_account_locker.clone(),
@@ -489,7 +496,7 @@ impl Tpu {
             replay_vote_sender,
             log_messages_bytes_limit,
             exit.clone(),
-            tip_manager,
+            tip_managers,
             bundle_account_locker,
             &block_builder_fee_info,
             bam_enabled,
