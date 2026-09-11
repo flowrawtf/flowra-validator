@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{env, process::Command};
 
 fn main() {
     // Watch both worktree-local and shared refs, including reftable storage.
@@ -17,6 +17,18 @@ fn main() {
             }
         }
     }
+    println!("cargo:rerun-if-env-changed=AGAVE_GIT_COMMIT_HASH");
+
+    // A build from a release tarball has no git history, so let the caller supply the hash the
+    // tarball was cut from. That is what makes the published binary reproducible off-tree.
+    if let Ok(hash) = env::var("AGAVE_GIT_COMMIT_HASH") {
+        let trimmed_hash = hash.trim();
+        if !trimmed_hash.is_empty() {
+            println!("cargo:rustc-env=AGAVE_GIT_COMMIT_HASH={trimmed_hash}");
+            return;
+        }
+    }
+
     if let Ok(git_output) = Command::new("git").args(["rev-parse", "HEAD"]).output()
         && git_output.status.success()
         && let Ok(git_commit_hash) = String::from_utf8(git_output.stdout)
