@@ -160,6 +160,23 @@ pub fn execute(
     info!("{} {}", crate_name!(), solana_version);
     info!("Starting validator with: {:#?}", std::env::args_os());
 
+    // Decided before the first data point can be produced. Off means nothing leaves the box:
+    // see solana_metrics::set_export_enabled.
+    let debug_telemetry = matches.is_present("flowra_debug_telemetry")
+        || matches!(
+            std::env::var("FLOWRA_DEBUG_TELEMETRY").as_deref(),
+            Ok("1") | Ok("true")
+        );
+    solana_metrics::set_export_enabled(debug_telemetry);
+    if debug_telemetry {
+        info!("debug telemetry enabled: metrics will be exported to SOLANA_METRICS_CONFIG");
+    } else if std::env::var_os("SOLANA_METRICS_CONFIG").is_some() {
+        warn!(
+            "SOLANA_METRICS_CONFIG is set but metrics export is off; pass \
+             --flowra-debug-telemetry to enable it"
+        );
+    }
+
     solana_metrics::set_host_id(identity_keypair.pubkey().to_string());
     solana_metrics::set_panic_hook("validator", Some(String::from(solana_version)));
 
@@ -789,7 +806,21 @@ pub fn execute(
     }
     let voting_disabled = matches.is_present("no_voting") || restricted_repair_only_mode;
 
-    let tip_manager_config = tip_manager_config_from_matches(matches, voting_disabled);
+    let tip_manager_configs = tip_manager_configs_from_matches(matches, voting_disabled);
+
+    // These never did anything: the values were parsed, logged, and read by nothing. Say so
+    // rather than printing a reassuring line about a reservation that does not exist.
+    for arg in ["bundle_cu_reserve_pct", "bundle_reserve_release_pct"] {
+        if matches.occurrences_of(arg) > 0 {
+            warn!(
+                "--{} is deprecated and ignored — no block CU is reserved for bundles. \
+                 Bundles get their ordering from the block engine and their account locks \
+                 from BundleStage; remove the flag.",
+                arg.replace('_', "-")
+            );
+        }
+    }
+
     let mut extra_bank_notification_senders = Vec::new();
     let tip_router_service_setup =
         tip_router::setup(matches, &mut extra_bank_notification_senders)?;
@@ -924,6 +955,7 @@ pub fn execute(
         snapshot_config,
         no_wait_for_vote_to_start_leader: matches.is_present("no_wait_for_vote_to_start_leader"),
         wait_to_vote_slot: value_t!(matches, "wait_to_vote_slot", Slot).ok(),
+        duplicate_slot_repair_bypass: matches.is_present("dangerous_duplicate_slot_repair_bypass"),
         staked_nodes_overrides: staked_nodes_overrides.clone(),
         use_snapshot_archives_at_startup,
         ip_echo_server_threads,
@@ -959,6 +991,9 @@ pub fn execute(
                 "block_production_pacing_fill_time_millis",
                 SchedulerPacing
             ),
+            target_scheduled_cus: matches
+                .is_present("block_production_target_scheduled_cus")
+                .then(|| value_t_or_exit!(matches, "block_production_target_scheduled_cus", u64)),
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
         enable_scheduler_bindings: matches.is_present("enable_scheduler_bindings"),
@@ -984,7 +1019,7 @@ pub fn execute(
         shred_receiver_addresses,
         shred_retransmit_receiver_addresses,
         multicast_receiver_address: Arc::new(ArcSwap::from_pointee(None)),
-        tip_manager_config,
+        tip_manager_configs,
         bam_url,
         disable_multicast_shred_check: matches.is_present("disable_multicast_shred_check"),
     };
@@ -1653,6 +1688,49 @@ mod xdp_tests {
             "XDP core overlapping PoH core must produce an error"
         );
     }
+}
+
+/// The tip programs this validator cranks, primary first.
+///
+/// A second set is configured when the validator also accepts bundles relayed from an
+/// upstream block engine: those bundles tip *that* engine's tip PDAs, derived from its own
+/// tip-payment program. Without cranking it, those tips are swept to whichever validator
+/// cranks it next — we would supply the block space and someone else would collect.
+fn tip_manager_configs_from_matches(
+    matches: &ArgMatches,
+    voting_disabled: bool,
+) -> Vec<TipManagerConfig> {
+    let mut configs = vec![tip_manager_config_from_matches(matches, voting_disabled)];
+
+    let upstream_payment = pubkey_of(matches, "upstream_tip_payment_program_pubkey");
+    let upstream_distribution = pubkey_of(matches, "upstream_tip_distribution_program_pubkey");
+    match (upstream_payment, upstream_distribution) {
+        (Some(tip_payment_program_id), Some(tip_distribution_program_id)) => {
+            // Same vote account, commission and merkle authority as the primary set: it is
+            // the same validator earning through a second program, so the same payout terms
+            // apply. Only the programs differ.
+            let primary = configs[0].tip_distribution_account_config.clone();
+            info!(
+                "upstream tip programs enabled: payment={tip_payment_program_id} \
+                 distribution={tip_distribution_program_id}"
+            );
+            configs.push(TipManagerConfig {
+                tip_payment_program_id,
+                tip_distribution_program_id,
+                tip_distribution_account_config: primary,
+            });
+        }
+        (None, None) => {}
+        _ => {
+            warn!(
+                "--upstream-tip-payment-program-pubkey and \
+                 --upstream-tip-distribution-program-pubkey must be given together; \
+                 upstream tip programs disabled"
+            );
+        }
+    }
+
+    configs
 }
 
 fn tip_manager_config_from_matches(
