@@ -14,6 +14,7 @@ use {
         proxy::{
             HeartbeatEvent, ProxyError,
             auth::{AuthInterceptor, AuthRefreshState, auth_client_from_endpoint},
+            block_engine_stage::BlockEngineStage,
             endpoint_from_url,
         },
     },
@@ -41,6 +42,10 @@ use {
 };
 
 const CONNECTION_TIMEOUT_S: u64 = 10;
+/// How often the validator re-pushes its policy to the relayer. Well inside the relayer's
+/// POLICY_TTL so a single missed push cannot expire the policy.
+const PBP_PUSH_INTERVAL: Duration = Duration::from_secs(60);
+
 const CONNECTION_BACKOFF_S: u64 = 5;
 
 #[derive(Default)]
@@ -274,6 +279,7 @@ impl RelayerStage {
         .into_inner();
 
         Self::consume_packet_stream(
+            client,
             heartbeat_event,
             heartbeat_tx,
             packet_stream,
@@ -289,7 +295,9 @@ impl RelayerStage {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn consume_packet_stream(
+        mut client: RelayerClient<InterceptedService<Channel, AuthInterceptor>>,
         heartbeat_event: HeartbeatEvent,
         heartbeat_tx: &Sender<HeartbeatEvent>,
         mut packet_stream: Streaming<relayer::SubscribePacketsResponse>,
@@ -313,6 +321,12 @@ impl RelayerStage {
         let mut heartbeat_check_interval = interval(local_config.expected_heartbeat_interval);
         let mut last_heartbeat_ts = Instant::now();
 
+        // The relayer expires a policy that stops being refreshed, so this has to keep ticking.
+        // It is its own interval and not the metrics tick: pushing once a second would be 86,400
+        // pushes a day for a rule set that changes maybe never.
+        let mut pbp_push_interval = interval(PBP_PUSH_INTERVAL);
+        let mut last_pbp_mtime = None;
+
         info!("connected to packet stream");
 
         while !exit.load(Ordering::Relaxed) {
@@ -327,6 +341,9 @@ impl RelayerStage {
                     if last_heartbeat_ts.elapsed() > local_config.oldest_allowed_heartbeat {
                         return Err(ProxyError::HeartbeatExpired);
                     }
+                }
+                _ = pbp_push_interval.tick() => {
+                    Self::push_pbp_policy(&mut client, connection_timeout, &mut last_pbp_mtime).await;
                 }
                 _ = metrics_and_auth_tick.tick() => {
                     relayer_stats.report();
@@ -362,6 +379,40 @@ impl RelayerStage {
             }
         }
         Ok(())
+    }
+
+    /// Push this validator's PBP policy to the relayer fronting its TPU.
+    ///
+    /// The relayer drops on behalf of one validator at a time and keys the policy by the
+    /// authenticated identity on this connection, so what is sent here governs only our own
+    /// stream. The same object goes to the block engine; both return a digest of what they
+    /// stored, and a mismatch between the two means they are enforcing different things.
+    async fn push_pbp_policy(
+        client: &mut RelayerClient<InterceptedService<Channel, AuthInterceptor>>,
+        connection_timeout: &Duration,
+        last_mtime: &mut Option<std::time::SystemTime>,
+    ) {
+        let Some(path) = BlockEngineStage::pbp_config_path() else {
+            return;
+        };
+        let mtime = BlockEngineStage::pbp_mtime(&path);
+        let Some(policy) = BlockEngineStage::load_pbp_policy(&path) else {
+            warn!("FLOWRA_PBP_CONFIG set but policy at {path:?} could not be loaded");
+            return;
+        };
+        match timeout(*connection_timeout, client.provide_pbp_policy(policy)).await {
+            Ok(Ok(response)) => {
+                let digest = response.into_inner().policy_digest;
+                // Only log on change; this fires on a timer and the policy is usually static.
+                if *last_mtime != mtime {
+                    info!("pushed PBP policy to relayer from {path:?}, digest {digest}");
+                    *last_mtime = mtime;
+                }
+                datapoint_info!("relayer_stage-pbp_policy", ("digest", digest, String),);
+            }
+            Ok(Err(status)) => warn!("relayer provide_pbp_policy failed: {status}"),
+            Err(_) => warn!("relayer provide_pbp_policy timed out"),
+        }
     }
 
     fn handle_relayer_packets(
