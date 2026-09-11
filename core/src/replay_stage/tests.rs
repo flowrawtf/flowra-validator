@@ -4565,6 +4565,7 @@ fn test_dump_then_repair_correct_slots() {
         &dumped_slots_sender,
         &Pubkey::new_unique(),
         leader_schedule_cache,
+        false,
     );
     assert_eq!(should_be_dumped, dumped_slots_receiver.recv().ok().unwrap());
 
@@ -4684,6 +4685,7 @@ fn setup_vote_then_rollback(
         &dumped_slots_sender,
         &Pubkey::new_unique(),
         leader_schedule_cache,
+        false,
     );
 
     // Check everything was purged properly
@@ -6078,6 +6080,7 @@ fn test_dumped_slot_not_causing_panic() {
         &dumped_slots_sender,
         my_pubkey,
         &leader_schedule_cache,
+        false,
     );
     assert_eq!(
         dumped_slots_receiver.recv_timeout(Duration::from_secs(1)),
@@ -6163,6 +6166,7 @@ fn test_dump_own_slots_fails() {
         &dumped_slots_sender,
         my_pubkey,
         leader_schedule_cache,
+        false,
     );
 }
 
