@@ -625,6 +625,18 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("dangerous_duplicate_slot_repair_bypass")
+            .hidden(hidden_unless_forced())
+            .long("dangerous-duplicate-slot-repair-bypass")
+            .help(
+                "Do not exit when a duplicate slot cannot be repaired after repeated attempts; \
+                 log and continue instead. That panic exists to stop a node that disagrees with \
+                 the cluster on a bank hash, so this is only for throwaway test clusters. The \
+                 validator refuses to start with this set on any genesis other than development \
+                 or devnet.",
+            ),
+    )
+    .arg(
         Arg::with_name("hard_forks")
             .long("hard-fork")
             .value_name("SLOT")
@@ -1206,6 +1218,23 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help(BlockProductionMethod::cli_message()),
     )
     .arg(
+        Arg::with_name("block_production_target_scheduled_cus")
+            .long("block-production-target-scheduled-cus")
+            .value_name("CUS")
+            .takes_value(true)
+            .validator(is_parsable::<u64>)
+            .help(
+                "Total in-flight compute units the block-production scheduler may hold across \
+                 all worker threads. The scheduler divides this by --block-production-num-workers \
+                 to get a per-thread quota, and a thread over quota cannot accept a transaction \
+                 whose accounts it already holds locked. Leaving this at the default while \
+                 raising the worker count therefore shrinks each thread's quota. Omit to track a \
+                 quarter of the bank's block cost limit, which follows feature-gated limit \
+                 raises; pass (block limit / 4 / <workers>) x <workers> to keep that ratio at a \
+                 fixed value.",
+            ),
+    )
+    .arg(
         Arg::with_name("block_production_pacing_fill_time_millis")
             .long("block-production-pacing-fill-time-millis")
             .value_name("MILLIS")
@@ -1301,6 +1330,33 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("The public key of the tip-distribution program."),
     )
     .arg(
+        Arg::with_name("upstream_tip_payment_program_pubkey")
+            .long("upstream-tip-payment-program-pubkey")
+            .value_name("UPSTREAM_TIP_PAYMENT_PROGRAM_PUBKEY")
+            .takes_value(true)
+            .requires("upstream_tip_distribution_program_pubkey")
+            .help(
+                "Public key of a SECOND tip-payment program to crank each leader slot. Set \
+                 this when accepting bundles relayed from an upstream block engine: those \
+                 bundles tip that engine's tip accounts, which belong to a different \
+                 tip-payment program. Without cranking it, those tips are swept to \
+                 whichever validator cranks it next.",
+            ),
+    )
+    .arg(
+        Arg::with_name("upstream_tip_distribution_program_pubkey")
+            .long("upstream-tip-distribution-program-pubkey")
+            .value_name("UPSTREAM_TIP_DISTRIBUTION_PROGRAM_PUBKEY")
+            .takes_value(true)
+            .requires("upstream_tip_payment_program_pubkey")
+            .help(
+                "Public key of the tip-distribution program paired with \
+                 --upstream-tip-payment-program-pubkey. The tip distribution account is \
+                 created under this program using the same vote account, commission and \
+                 merkle-root upload authority as the primary set.",
+            ),
+    )
+    .arg(
         Arg::with_name("merkle_root_upload_authority")
             .long("merkle-root-upload-authority")
             .value_name("MERKLE_ROOT_UPLOAD_AUTHORITY")
@@ -1323,6 +1379,39 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "Disables Block Engine auto-configuration. This stops the validator client from \
                  using the most performant Block Engine region. Values provided to \
                  `--block-engine-url` will be used as-is.",
+            ),
+    )
+    .arg(
+        // DEPRECATED, no effect. Never implemented: the value was parsed, logged, and read
+        // by nothing. Still accepted so launch scripts that pass it keep starting; the
+        // validator warns instead. Remove once those have been updated.
+        Arg::with_name("bundle_cu_reserve_pct")
+            .long("bundle-cu-reserve-pct")
+            .value_name("BUNDLE_CU_RESERVE_PCT")
+            .takes_value(true)
+            .hidden(true)
+            .help("DEPRECATED and ignored. No block CU is reserved for bundles."),
+    )
+    .arg(
+        // DEPRECATED, no effect — see --bundle-cu-reserve-pct.
+        Arg::with_name("bundle_reserve_release_pct")
+            .long("bundle-reserve-release-pct")
+            .value_name("BUNDLE_RESERVE_RELEASE_PCT")
+            .takes_value(true)
+            .hidden(true)
+            .help("DEPRECATED and ignored. No block CU is reserved for bundles."),
+    )
+    .arg(
+        Arg::with_name("flowra_debug_telemetry")
+            .long("flowra-debug-telemetry")
+            .takes_value(false)
+            .help(
+                "Export metrics to the host named by SOLANA_METRICS_CONFIG. Off by default: \
+                 this fork carries extra instrumentation that is only useful to whoever is \
+                 debugging it, and without this flag the validator does not queue, serialize \
+                 or transmit a single data point, and opens no connection to a metrics host. \
+                 SOLANA_METRICS_CONFIG alone does nothing. FLOWRA_DEBUG_TELEMETRY=1 has the \
+                 same effect as passing this flag.",
             ),
     )
     .arg(
