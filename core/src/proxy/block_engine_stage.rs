@@ -26,6 +26,7 @@ use {
             self, BlockBuilderFeeInfoRequest, BlockEngineEndpoint, GetBlockEngineEndpointRequest,
             block_engine_validator_client::BlockEngineValidatorClient,
         },
+        shared,
     },
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
@@ -42,7 +43,7 @@ use {
             atomic::{AtomicBool, AtomicU8, Ordering},
         },
         thread::{self, Builder, JoinHandle},
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
     thiserror::Error,
     tokio::{
@@ -798,6 +799,10 @@ impl BlockEngineStage {
         // connection setup must not publish a candidate's destination.
         shredstream_receiver_address.store(Arc::new(maybe_shredstream_socket));
 
+        // Validator is the PBP policy authority: push our policy to the engine on connect.
+        Self::push_pbp_policy(&mut client, connection_timeout).await;
+        // The upstream token is pushed by the stream loop below, which owns its schedule.
+
         Self::consume_bundle_and_packet_stream(
             client,
             (subscribe_bundles_stream, subscribe_packets_stream),
@@ -855,6 +860,16 @@ impl BlockEngineStage {
 
         info!("connected to packet and bundle stream");
 
+        // Track the PBP policy file so we can re-push to the engine when it changes.
+        let pbp_path = Self::pbp_config_path();
+        let mut pbp_mtime = pbp_path.as_deref().and_then(Self::pbp_mtime);
+
+        // When the next upstream token is due. The push mints a token upstream — a fresh
+        // connection and a full challenge/sign/exchange — so it must be driven by the
+        // token's own lifetime, not by this tick. It shares the metrics tick only because
+        // that is the loop's clock.
+        let mut upstream_push_due = Instant::now();
+
         while !exit.load(Ordering::Relaxed) {
             if bam_enabled.load(Ordering::Acquire) > BamConnectionState::Connecting as u8 {
                 info!("bam enabled, exiting block engine stage");
@@ -879,6 +894,27 @@ impl BlockEngineStage {
                 _ = metrics_and_auth_tick.tick() => {
                     block_engine_stats.report();
                     block_engine_stats = BlockEngineStageStats::default();
+
+                    // Hot-reload: if the validator's PBP file changed, re-push to the engine.
+                    if let Some(path) = pbp_path.as_deref() {
+                        let m = Self::pbp_mtime(path);
+                        if m.is_some() && m != pbp_mtime {
+                            pbp_mtime = m;
+                            Self::push_pbp_policy(&mut client, connection_timeout).await;
+                        }
+                    }
+
+                    // Re-mint the upstream token only once it is close to expiring. Doing
+                    // this every tick would re-authenticate upstream once a second, which
+                    // no upstream should be expected to tolerate.
+                    if Instant::now() >= upstream_push_due {
+                        upstream_push_due = Self::push_upstream_token(
+                            &mut client,
+                            connection_timeout,
+                            &keypair,
+                        )
+                        .await;
+                    }
 
                     if cluster_info.id() != keypair.pubkey() {
                         return Err(ProxyError::AuthenticationConnectionError("validator identity changed".to_string()));
@@ -930,6 +966,233 @@ impl BlockEngineStage {
         }
 
         Ok(())
+    }
+
+    /// Path to the validator-owned PBP policy file, if configured via env.
+    /// The validator is the policy authority; it pushes this to the block engine.
+    pub(crate) fn pbp_config_path() -> Option<std::path::PathBuf> {
+        std::env::var("FLOWRA_PBP_CONFIG")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
+    pub(crate) fn pbp_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+
+    /// Parse the PBP TOML into a wire PbpPolicy message.
+    pub(crate) fn load_pbp_policy(path: &std::path::Path) -> Option<shared::PbpPolicy> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let val: toml::Value = toml::from_str(&content).ok()?;
+        let arr = |table: &str, key: &str| -> Vec<String> {
+            val.get(table)
+                .and_then(|t| t.get(key))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // E3: parse the `[[category_quotas]]` array-of-tables (name, pct, program_ids).
+        let category_quotas: Vec<shared::CategoryQuota> = val
+            .get("category_quotas")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|q| {
+                        let name = q.get("name").and_then(|v| v.as_str())?.to_string();
+                        let pct = q.get("pct").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
+                        let program_ids = q
+                            .get("program_ids")
+                            .and_then(|v| v.as_array())
+                            .map(|p| {
+                                p.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Some(shared::CategoryQuota {
+                            name,
+                            pct,
+                            program_ids,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Some(shared::PbpPolicy {
+            allow_aggressive_mev: val
+                .get("policy")
+                .and_then(|p| p.get("allow_aggressive_mev"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            searcher_whitelist: arr("searcher_whitelist", "pubkeys"),
+            address_blacklist: arr("address_blacklist", "addresses"),
+            program_blacklist: arr("program_blacklist", "program_ids"),
+            // E1/E5, E4, E3 — new programmable-policy knobs.
+            program_allowlist: arr("program_allowlist", "program_ids"),
+            force_priority_searchers: arr("force_priority", "searchers"),
+            category_quotas,
+            // [[instruction_blacklist]] entries: program_id + hex data prefixes, for naming one
+            // instruction of an otherwise legitimate program.
+            instruction_blacklist: val
+                .get("instruction_blacklist")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|rule| {
+                            Some(shared::InstructionRule {
+                                program_id: rule
+                                    .get("program_id")
+                                    .and_then(|v| v.as_str())?
+                                    .to_string(),
+                                data_prefixes: rule
+                                    .get("data_prefixes")
+                                    .and_then(|v| v.as_array())
+                                    .map(|p| {
+                                        p.iter()
+                                            .filter_map(|x| x.as_str().map(String::from))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Authenticate to an UPSTREAM block engine and hand our block engine the resulting
+    /// access token (best-effort; enabled by `FLOWRA_UPSTREAM_BLOCK_ENGINE_URL`).
+    ///
+    /// The upstream scopes order flow to the leader slots of whichever identity
+    /// authenticated, so the token has to be minted by *this validator's* identity key. We
+    /// mint it here and send only the token: the key never leaves the validator, while the
+    /// block engine still holds the upstream stream and merges its flow with its own.
+    ///
+    /// Returns when this should next run. Each call opens a connection to the upstream and
+    /// runs a full challenge/sign/exchange, so callers must respect that deadline rather
+    /// than calling on a fixed tick.
+    ///
+    /// Prefer relaying the handshake through the block engine (which needs nothing set here)
+    /// — a token minted on this host may be refused when the engine subscribes with it.
+    async fn push_upstream_token(
+        client: &mut BlockEngineValidatorClient<InterceptedService<Channel, AuthInterceptor>>,
+        connection_timeout: &Duration,
+        keypair: &Arc<Keypair>,
+    ) -> Instant {
+        /// Back off this long after a failure, so an upstream that is refusing us is not
+        /// hammered.
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        /// Re-mint this long before expiry.
+        const REFRESH_MARGIN: Duration = Duration::from_secs(120);
+        /// Never re-mint more often than this, however short-lived the token claims to be.
+        const MIN_INTERVAL: Duration = Duration::from_secs(60);
+        /// Used when the upstream does not say when the token expires.
+        const UNKNOWN_EXPIRY_INTERVAL: Duration = Duration::from_secs(600);
+
+        let retry = || Instant::now() + RETRY_AFTER;
+
+        let Ok(upstream_url) = std::env::var("FLOWRA_UPSTREAM_BLOCK_ENGINE_URL") else {
+            // Nothing configured: check again rarely, in case it appears at runtime.
+            return Instant::now() + UNKNOWN_EXPIRY_INTERVAL;
+        };
+        if upstream_url.is_empty() {
+            return Instant::now() + UNKNOWN_EXPIRY_INTERVAL;
+        }
+
+        let endpoint = match Endpoint::from_shared(upstream_url.clone()) {
+            Ok(ep) => {
+                let ep = ep.tcp_keepalive(Some(Duration::from_secs(60)));
+                if upstream_url.starts_with("https://") {
+                    // with_enabled_roots() is load-bearing: ClientTlsConfig::new() carries no
+                    // trust anchors at all, so the handshake fails as a bare "transport error".
+                    match ep
+                        .tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())
+                    {
+                        Ok(ep) => ep,
+                        Err(e) => {
+                            warn!("upstream {upstream_url}: tls config failed: {e}");
+                            return retry();
+                        }
+                    }
+                } else {
+                    ep
+                }
+            }
+            Err(e) => {
+                warn!("FLOWRA_UPSTREAM_BLOCK_ENGINE_URL is not a valid endpoint: {e}");
+                return retry();
+            }
+        };
+
+        let (_auth_client, access_token, _refresh) =
+            match auth_client_from_endpoint(&endpoint, connection_timeout, keypair).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("upstream {upstream_url}: authentication failed: {e:?}");
+                    return retry();
+                }
+            };
+
+        let token = access_token.load();
+        let expires_at = token.expires_at_utc;
+        let request = block_engine::UpstreamToken {
+            upstream_url: upstream_url.clone(),
+            access_token: token.value.clone(),
+            expires_at_utc: expires_at,
+        };
+        match timeout(*connection_timeout, client.provide_upstream_token(request)).await {
+            Ok(Ok(resp)) => info!(
+                "handed block engine an upstream token for {upstream_url} (refresh margin {}s)",
+                resp.into_inner().refresh_margin_secs
+            ),
+            Ok(Err(status)) => {
+                warn!("provide_upstream_token failed: {status}");
+                return retry();
+            }
+            Err(_) => {
+                warn!("provide_upstream_token timed out");
+                return retry();
+            }
+        }
+
+        // Next mint is driven by this token's own lifetime.
+        let lifetime = expires_at
+            .and_then(|ts| {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+                u64::try_from(ts.seconds.saturating_sub(now)).ok()
+            })
+            .map(Duration::from_secs);
+        let until_due = match lifetime {
+            Some(l) => l.saturating_sub(REFRESH_MARGIN).max(MIN_INTERVAL),
+            None => UNKNOWN_EXPIRY_INTERVAL,
+        };
+        Instant::now() + until_due
+    }
+
+    /// Push the validator's current PBP policy to the block engine (best-effort).
+    async fn push_pbp_policy(
+        client: &mut BlockEngineValidatorClient<InterceptedService<Channel, AuthInterceptor>>,
+        connection_timeout: &Duration,
+    ) {
+        let Some(path) = Self::pbp_config_path() else {
+            return;
+        };
+        let Some(policy) = Self::load_pbp_policy(&path) else {
+            warn!("FLOWRA_PBP_CONFIG set but policy at {path:?} could not be loaded");
+            return;
+        };
+        match timeout(*connection_timeout, client.provide_pbp_policy(policy)).await {
+            Ok(Ok(_)) => info!("pushed PBP policy to block engine from {path:?}"),
+            Ok(Err(status)) => warn!("provide_pbp_policy failed: {status}"),
+            Err(_) => warn!("provide_pbp_policy timed out"),
+        }
     }
 
     fn handle_block_engine_bundles(

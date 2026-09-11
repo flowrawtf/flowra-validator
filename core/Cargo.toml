@@ -104,6 +104,7 @@ serde_bytes = { workspace = true }
 shaq = { workspace = true }
 signal-hook = { workspace = true }
 slab = { workspace = true }
+toml = { workspace = true }
 smallvec = { workspace = true }
 solana-account = { workspace = true, features = ["wincode"] }
 solana-accounts-db = { workspace = true }
