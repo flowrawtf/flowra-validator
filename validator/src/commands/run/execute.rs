@@ -1696,6 +1696,11 @@ mod xdp_tests {
 /// upstream block engine: those bundles tip *that* engine's tip PDAs, derived from its own
 /// tip-payment program. Without cranking it, those tips are swept to whichever validator
 /// cranks it next — we would supply the block space and someone else would collect.
+/// Merkle root upload authority of Jito's TipRouter, which settles tips paid through Jito's
+/// tip programs for validators that name it in their tip distribution accounts.
+const JITO_TIP_ROUTER_MERKLE_ROOT_UPLOAD_AUTHORITY: Pubkey =
+    solana_pubkey::pubkey!("8F4jGUmxF36vQ6yabnsxX6AQVXdKBhs8kGSUuRKSg8Xt");
+
 fn tip_manager_configs_from_matches(
     matches: &ArgMatches,
     voting_disabled: bool,
@@ -1706,18 +1711,24 @@ fn tip_manager_configs_from_matches(
     let upstream_distribution = pubkey_of(matches, "upstream_tip_distribution_program_pubkey");
     match (upstream_payment, upstream_distribution) {
         (Some(tip_payment_program_id), Some(tip_distribution_program_id)) => {
-            // Same vote account, commission and merkle authority as the primary set: it is
-            // the same validator earning through a second program, so the same payout terms
-            // apply. Only the programs differ.
-            let primary = configs[0].tip_distribution_account_config.clone();
+            // Same vote account and commission as the primary set: it is the same validator
+            // earning through a second program, so the same payout terms apply. The merkle
+            // root, though, is uploaded by whoever settles that program's tips, which for an
+            // upstream engine is its own settlement service, not ours.
+            let mut upstream = configs[0].tip_distribution_account_config.clone();
+            upstream.merkle_root_upload_authority =
+                pubkey_of(matches, "upstream_merkle_root_upload_authority")
+                    .unwrap_or(JITO_TIP_ROUTER_MERKLE_ROOT_UPLOAD_AUTHORITY);
             info!(
                 "upstream tip programs enabled: payment={tip_payment_program_id} \
-                 distribution={tip_distribution_program_id}"
+                 distribution={tip_distribution_program_id} \
+                 merkle_root_upload_authority={}",
+                upstream.merkle_root_upload_authority
             );
             configs.push(TipManagerConfig {
                 tip_payment_program_id,
                 tip_distribution_program_id,
-                tip_distribution_account_config: primary,
+                tip_distribution_account_config: upstream,
             });
         }
         (None, None) => {}
@@ -1767,5 +1778,105 @@ fn tip_manager_config_from_matches(
             commission_bps: value_t!(matches, "commission_bps", u16)
                 .expect("--commission-bps argument required when validator is voting"),
         },
+    }
+}
+
+#[cfg(test)]
+mod upstream_tip_config_tests {
+    use {
+        super::*,
+        crate::{
+            cli::{DefaultArgs, thread_args::thread_args},
+            commands::run::args::add_args,
+        },
+        clap::App,
+    };
+
+    const PRIMARY_AUTHORITY: &str = "5LTodMSRDDKBDvvgUtSxo17gk8dv6cdnAcKFYnMnybV7";
+
+    fn configs(extra: &[&str]) -> Vec<TipManagerConfig> {
+        let default_args = DefaultArgs::default();
+        let app = add_args(App::new("run"), &default_args)
+            .args(&thread_args(&default_args.thread_args));
+        let identity = tempfile::NamedTempFile::new().unwrap();
+        solana_keypair::write_keypair_file(&Keypair::new(), identity.path()).unwrap();
+        let identity = identity.path().to_str().unwrap().to_string();
+        let vote = Pubkey::new_unique().to_string();
+        let payment = Pubkey::new_unique().to_string();
+        let distribution = Pubkey::new_unique().to_string();
+        let mut argv = vec![
+            "run",
+            "--identity",
+            &identity,
+            "--vote-account",
+            &vote,
+            "--tip-payment-program-pubkey",
+            &payment,
+            "--tip-distribution-program-pubkey",
+            &distribution,
+            "--merkle-root-upload-authority",
+            PRIMARY_AUTHORITY,
+            "--commission-bps",
+            "800",
+        ];
+        argv.extend_from_slice(extra);
+        tip_manager_configs_from_matches(&app.get_matches_from(argv), false)
+    }
+
+    #[test]
+    fn upstream_authority_defaults_to_jito_tip_router() {
+        let upstream_payment = Pubkey::new_unique().to_string();
+        let upstream_distribution = Pubkey::new_unique().to_string();
+        let configs = configs(&[
+            "--upstream-tip-payment-program-pubkey",
+            &upstream_payment,
+            "--upstream-tip-distribution-program-pubkey",
+            &upstream_distribution,
+        ]);
+        assert_eq!(configs.len(), 2);
+        let primary = &configs[0].tip_distribution_account_config;
+        let upstream = &configs[1].tip_distribution_account_config;
+        assert_eq!(
+            primary.merkle_root_upload_authority.to_string(),
+            PRIMARY_AUTHORITY
+        );
+        assert_eq!(
+            upstream.merkle_root_upload_authority,
+            JITO_TIP_ROUTER_MERKLE_ROOT_UPLOAD_AUTHORITY
+        );
+        assert_eq!(upstream.vote_account, primary.vote_account);
+        assert_eq!(upstream.commission_bps, primary.commission_bps);
+    }
+
+    #[test]
+    fn upstream_authority_can_be_set() {
+        let upstream_payment = Pubkey::new_unique().to_string();
+        let upstream_distribution = Pubkey::new_unique().to_string();
+        let own = Pubkey::new_unique();
+        let own_str = own.to_string();
+        let configs = configs(&[
+            "--upstream-tip-payment-program-pubkey",
+            &upstream_payment,
+            "--upstream-tip-distribution-program-pubkey",
+            &upstream_distribution,
+            "--upstream-merkle-root-upload-authority",
+            &own_str,
+        ]);
+        assert_eq!(
+            configs[1].tip_distribution_account_config.merkle_root_upload_authority,
+            own
+        );
+        assert_eq!(
+            configs[0]
+                .tip_distribution_account_config
+                .merkle_root_upload_authority
+                .to_string(),
+            PRIMARY_AUTHORITY
+        );
+    }
+
+    #[test]
+    fn no_upstream_programs_means_one_config() {
+        assert_eq!(configs(&[]).len(), 1);
     }
 }
