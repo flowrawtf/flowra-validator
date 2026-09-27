@@ -1666,7 +1666,9 @@ mod tests {
                 Err(crate::tip_manager::TipManagerError::AccountMissing)
             ),
             "crank must fail after the config PDA is dropped: {:?}",
-            crank.as_ref().map(|steps| steps.iter().map(|step| step.label).collect::<Vec<_>>())
+            crank
+                .as_ref()
+                .map(|steps| steps.iter().map(|step| step.label).collect::<Vec<_>>())
         );
     }
 
@@ -1696,7 +1698,9 @@ mod tests {
         assert!(
             crank.is_ok(),
             "crank should build after a persisted init: {:?}",
-            crank.as_ref().map(|steps| steps.iter().map(|step| step.label).collect::<Vec<_>>())
+            crank
+                .as_ref()
+                .map(|steps| steps.iter().map(|step| step.label).collect::<Vec<_>>())
         );
     }
 
