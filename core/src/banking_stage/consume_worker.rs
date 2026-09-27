@@ -3171,16 +3171,16 @@ mod tests {
                 .primary()
                 .get_my_tip_distribution_pda(bank.epoch())
         );
+        // The crank commits one record per step; together they are the whole crank.
         let records: Vec<_> = frame.record_receiver.drain().collect();
-        assert_eq!(records.len(), 1);
-        assert!(!records[0].reschedule_on_sad_handover);
-        assert_eq!(records[0].transactions.len(), crank.len());
-        assert!(
-            records[0]
-                .transactions
-                .iter()
-                .all(|tx| tx.signatures[0] != signature)
-        );
+        assert!(!records.is_empty());
+        assert!(records.iter().all(|r| !r.reschedule_on_sad_handover));
+        let recorded: Vec<_> = records
+            .into_iter()
+            .flat_map(|r| r.transactions)
+            .collect();
+        assert_eq!(recorded.len(), crank.len());
+        assert!(recorded.iter().all(|tx| tx.signatures[0] != signature));
         let prepared_cost = block_costs(&bank).0 - estimate;
 
         if let Some(succeeds) = replacement_succeeds {
