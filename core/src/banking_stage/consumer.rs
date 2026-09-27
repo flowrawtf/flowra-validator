@@ -166,7 +166,10 @@ impl TipProcessingDependencies {
                         let mut steps_ok = true;
                         for step in steps {
                             if !process(Ok(step.txs)) {
-                                warn!("tip program {program} crank step {} did not commit", step.label);
+                                warn!(
+                                    "tip program {program} crank step {} did not commit",
+                                    step.label
+                                );
                                 steps_ok = false;
                                 if step.blocking {
                                     break;
