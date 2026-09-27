@@ -3996,11 +3996,15 @@ mod tests {
                 .primary()
                 .get_my_tip_distribution_pda(bank.epoch())
         );
+        // The crank commits one record per step; together they are the whole crank.
         let records: Vec<_> = frame.record_receiver.drain().collect();
-        assert_eq!(records.len(), 1);
-        assert!(!records[0].reschedule_on_sad_handover);
+        assert!(!records.is_empty());
+        assert!(records.iter().all(|r| !r.reschedule_on_sad_handover));
         assert_eq!(
-            records[0].transactions,
+            records
+                .into_iter()
+                .flat_map(|r| r.transactions)
+                .collect::<Vec<_>>(),
             crank
                 .iter()
                 .map(|tx| tx.to_versioned_transaction())
