@@ -2264,7 +2264,7 @@ mod tests {
             bundle_stage::bundle_account_locker::BundleAccountLocker,
             proxy::block_engine_stage::BlockBuilderFeeInfo,
             tip_manager::{
-                TipDistributionAccountConfig, TipManager, TipManagerConfig,
+                TipDistributionAccountConfig, TipManagerConfig, TipManagers,
                 tip_payment::JitoTipPaymentConfig,
             },
         },
@@ -2393,7 +2393,7 @@ mod tests {
         (
             TestFrame {
                 tip_processing_dependencies: default_rent.then(|| TipProcessingDependencies {
-                    tip_manager: TipManager::new(TipManagerConfig {
+                    tip_managers: TipManagers::new(vec![TipManagerConfig {
                         tip_payment_program_id: Pubkey::new_from_array(
                             *jito_tip_payment::id().as_array(),
                         ),
@@ -2405,7 +2405,7 @@ mod tests {
                             vote_account: voting_keypair.pubkey(),
                             commission_bps: 0,
                         },
-                    }),
+                    }]),
                     block_builder_fee_info: Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo {
                         block_builder: mint_keypair.pubkey(),
                         block_builder_commission: 0,
@@ -3059,7 +3059,7 @@ mod tests {
         let config = |bank: &Bank| {
             JitoTipPaymentConfig::from_account_shared_data(
                 &bank
-                    .get_account(&tips.tip_manager.tip_payment_config_pubkey())
+                    .get_account(&tips.tip_managers.primary().tip_payment_config_pubkey())
                     .unwrap(),
                 &jito_tip_payment::id(),
             )
@@ -3082,14 +3082,18 @@ mod tests {
             )]));
         }
         // The first BAM batch has no tip account, but must not get ahead of the crank.
-        let crank = tips
-            .tip_manager
-            .get_tip_programs_crank_bundle(
+        let crank: Vec<_> = tips
+            .tip_managers
+            .primary()
+            .get_crank_steps(
                 &bank,
                 &tips.cluster_info.keypair(),
                 &tips.block_builder_fee_info.load(),
             )
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .flat_map(|step| step.txs)
+            .collect();
         let estimated_cost = |txs: &[RuntimeTransaction<SanitizedTransaction>]| -> u64 {
             QosService::compute_transaction_costs(
                 &bank.feature_set,
@@ -3163,7 +3167,9 @@ mod tests {
         assert_eq!(config(&bank).block_builder(), tips.cluster_info.id());
         assert_eq!(
             config(&bank).tip_receiver(),
-            tips.tip_manager.get_my_tip_distribution_pda(bank.epoch())
+            tips.tip_managers
+                .primary()
+                .get_my_tip_distribution_pda(bank.epoch())
         );
         let records: Vec<_> = frame.record_receiver.drain().collect();
         assert_eq!(records.len(), 1);
@@ -3287,7 +3293,7 @@ mod tests {
         let config = || {
             let config = JitoTipPaymentConfig::from_account_shared_data(
                 &bank
-                    .get_account(&tips.tip_manager.tip_payment_config_pubkey())
+                    .get_account(&tips.tip_managers.primary().tip_payment_config_pubkey())
                     .unwrap(),
                 &jito_tip_payment::id(),
             )
@@ -3381,7 +3387,7 @@ mod tests {
         let signature = enqueue(
             &mut container,
             &tips.cluster_info.keypair(),
-            *tips.tip_manager.get_tip_accounts().iter().next().unwrap(),
+            *tips.tip_managers.primary().get_tip_accounts().iter().next().unwrap(),
             1,
         );
         if let Some(work) = old_work {
@@ -3402,7 +3408,7 @@ mod tests {
         }
 
         // Even a previously prepared Bank must hold new work if refresh fails.
-        let config_key = tips.tip_manager.tip_payment_config_pubkey();
+        let config_key = tips.tip_managers.primary().tip_payment_config_pubkey();
         let settled = block_costs(&bank);
         tips.bundle_account_locker
             .account_locks()
@@ -3501,7 +3507,7 @@ mod tests {
         frame.record_receiver.drain().for_each(drop);
         // Earlier success must not mask metadata or account changes on this same Bank.
         let bank = &frame.bank;
-        let config_key = tips.tip_manager.tip_payment_config_pubkey();
+        let config_key = tips.tip_managers.primary().tip_payment_config_pubkey();
         let original = bank.get_account(&config_key).unwrap();
         let cost = block_costs(bank).0;
         let transaction_count = bank.transaction_count();
