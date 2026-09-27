@@ -1352,8 +1352,23 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help(
                 "Public key of the tip-distribution program paired with \
                  --upstream-tip-payment-program-pubkey. The tip distribution account is \
-                 created under this program using the same vote account, commission and \
-                 merkle-root upload authority as the primary set.",
+                 created under this program using the same vote account and commission as \
+                 the primary set, and --upstream-merkle-root-upload-authority.",
+            ),
+    )
+    .arg(
+        Arg::with_name("upstream_merkle_root_upload_authority")
+            .long("upstream-merkle-root-upload-authority")
+            .value_name("UPSTREAM_MERKLE_ROOT_UPLOAD_AUTHORITY")
+            .takes_value(true)
+            .requires("upstream_tip_payment_program_pubkey")
+            .help(
+                "Merkle root upload authority recorded in the upstream tip distribution \
+                 account. Only that key can upload the merkle root that pays out the \
+                 upstream tips. Defaults to Jito's TipRouter authority \
+                 (8F4jGUmxF36vQ6yabnsxX6AQVXdKBhs8kGSUuRKSg8Xt), so Jito settles the upstream \
+                 tips as it does for any Jito validator. Set it only if you upload the \
+                 upstream merkle roots yourself.",
             ),
     )
     .arg(
