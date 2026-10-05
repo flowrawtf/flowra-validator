@@ -19,6 +19,10 @@ use {
 };
 
 /// Interceptor responsible for adding the access token to request headers.
+///
+/// `Clone` shares the token: every clone reads the same `ArcSwap`, so a refresh made by the
+/// stream loop reaches clients cloned off it for side tasks.
+#[derive(Clone)]
 pub(crate) struct AuthInterceptor {
     /// The token added to each request header.
     access_token: Arc<ArcSwap<Token>>,
