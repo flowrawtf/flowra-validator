@@ -14,7 +14,7 @@ use {
         proxy::{
             HeartbeatEvent, ProxyError,
             auth::{AuthInterceptor, auth_client_from_endpoint, maybe_refresh_auth_tokens},
-            block_engine_stage::BlockEngineStage,
+            block_engine_stage::{AbortOnDrop, BlockEngineStage},
             endpoint_from_url,
         },
     },
@@ -314,7 +314,7 @@ impl RelayerStage {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     async fn consume_packet_stream(
-        mut client: RelayerClient<InterceptedService<Channel, AuthInterceptor>>,
+        client: RelayerClient<InterceptedService<Channel, AuthInterceptor>>,
         heartbeat_event: HeartbeatEvent,
         heartbeat_tx: &Sender<HeartbeatEvent>,
         mut packet_stream: Streaming<relayer::SubscribePacketsResponse>,
@@ -344,8 +344,23 @@ impl RelayerStage {
         // The relayer expires a policy that stops being refreshed, so this has to keep ticking.
         // It is its own interval and not the metrics tick: pushing once a second would be 86,400
         // pushes a day for a rule set that changes maybe never.
-        let mut pbp_push_interval = interval(PBP_PUSH_INTERVAL);
-        let mut last_pbp_mtime = None;
+        //
+        // It runs beside the packet loop, not in it: a push waits up to `connection_timeout`,
+        // and awaited here it would stop the TPU packets this loop forwards (and the heartbeat
+        // check) for that long.
+        let _pbp_push = AbortOnDrop(tokio::spawn({
+            let mut client = client.clone();
+            let connection_timeout = *connection_timeout;
+            async move {
+                let mut pbp_push_interval = interval(PBP_PUSH_INTERVAL);
+                let mut last_pbp_mtime = None;
+                loop {
+                    pbp_push_interval.tick().await;
+                    Self::push_pbp_policy(&mut client, &connection_timeout, &mut last_pbp_mtime)
+                        .await;
+                }
+            }
+        }));
 
         info!("connected to packet stream");
 
@@ -361,9 +376,6 @@ impl RelayerStage {
                     if last_heartbeat_ts.elapsed() > local_config.oldest_allowed_heartbeat {
                         return Err(ProxyError::HeartbeatExpired);
                     }
-                }
-                _ = pbp_push_interval.tick() => {
-                    Self::push_pbp_policy(&mut client, connection_timeout, &mut last_pbp_mtime).await;
                 }
                 _ = metrics_and_auth_tick.tick() => {
                     relayer_stats.report();

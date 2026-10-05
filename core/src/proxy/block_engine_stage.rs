@@ -98,6 +98,15 @@ pub struct BlockEngineConfig {
     pub trust_packets: bool,
 }
 
+/// Aborts the task when dropped, so a helper spawned for one connection cannot outlive it.
+pub(crate) struct AbortOnDrop<T>(pub(crate) tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct BlockEngineStage {
     t_hdls: Vec<JoinHandle<()>>,
 }
@@ -860,15 +869,16 @@ impl BlockEngineStage {
 
         info!("connected to packet and bundle stream");
 
-        // Track the PBP policy file so we can re-push to the engine when it changes.
-        let pbp_path = Self::pbp_config_path();
-        let mut pbp_mtime = pbp_path.as_deref().and_then(Self::pbp_mtime);
-
-        // When the next upstream token is due. The push mints a token upstream — a fresh
-        // connection and a full challenge/sign/exchange — so it must be driven by the
-        // token's own lifetime, not by this tick. It shares the metrics tick only because
-        // that is the loop's clock.
-        let mut upstream_push_due = Instant::now();
+        // PBP hot-reload and the upstream token push are control-plane RPCs. Each one can wait
+        // up to `connection_timeout` (the upstream push also opens a connection and runs a full
+        // auth exchange), and awaited here they would stop this loop from reading bundles and
+        // packets for that long. They run beside it instead, on a clone of the client (tonic
+        // clients share one channel), and die with it.
+        let _control = AbortOnDrop(tokio::spawn(Self::control_loop(
+            client.clone(),
+            *connection_timeout,
+            keypair.clone(),
+        )));
 
         while !exit.load(Ordering::Relaxed) {
             if bam_enabled.load(Ordering::Acquire) > BamConnectionState::Connecting as u8 {
@@ -894,27 +904,6 @@ impl BlockEngineStage {
                 _ = metrics_and_auth_tick.tick() => {
                     block_engine_stats.report();
                     block_engine_stats = BlockEngineStageStats::default();
-
-                    // Hot-reload: if the validator's PBP file changed, re-push to the engine.
-                    if let Some(path) = pbp_path.as_deref() {
-                        let m = Self::pbp_mtime(path);
-                        if m.is_some() && m != pbp_mtime {
-                            pbp_mtime = m;
-                            Self::push_pbp_policy(&mut client, connection_timeout).await;
-                        }
-                    }
-
-                    // Re-mint the upstream token only once it is close to expiring. Doing
-                    // this every tick would re-authenticate upstream once a second, which
-                    // no upstream should be expected to tolerate.
-                    if Instant::now() >= upstream_push_due {
-                        upstream_push_due = Self::push_upstream_token(
-                            &mut client,
-                            connection_timeout,
-                            &keypair,
-                        )
-                        .await;
-                    }
 
                     if cluster_info.id() != keypair.pubkey() {
                         return Err(ProxyError::AuthenticationConnectionError("validator identity changed".to_string()));
@@ -1174,6 +1163,37 @@ impl BlockEngineStage {
             None => UNKNOWN_EXPIRY_INTERVAL,
         };
         Instant::now() + until_due
+    }
+
+    /// Control-plane pushes that must not share the data loop: re-push the PBP policy when its
+    /// file changes, and re-mint the upstream token when it is close to expiring. Runs until
+    /// aborted by the stream loop that spawned it.
+    async fn control_loop(
+        mut client: BlockEngineValidatorClient<InterceptedService<Channel, AuthInterceptor>>,
+        connection_timeout: Duration,
+        keypair: Arc<Keypair>,
+    ) {
+        const TICK: Duration = Duration::from_secs(1);
+        let pbp_path = Self::pbp_config_path();
+        let mut pbp_mtime = pbp_path.as_deref().and_then(Self::pbp_mtime);
+        // The push mints a token upstream — a fresh connection and a full
+        // challenge/sign/exchange — so it is driven by the token's own lifetime, not by the tick.
+        let mut upstream_push_due = Instant::now();
+        let mut tick = interval(TICK);
+        loop {
+            tick.tick().await;
+            if let Some(path) = pbp_path.as_deref() {
+                let m = Self::pbp_mtime(path);
+                if m.is_some() && m != pbp_mtime {
+                    pbp_mtime = m;
+                    Self::push_pbp_policy(&mut client, &connection_timeout).await;
+                }
+            }
+            if Instant::now() >= upstream_push_due {
+                upstream_push_due =
+                    Self::push_upstream_token(&mut client, &connection_timeout, &keypair).await;
+            }
+        }
     }
 
     /// Push the validator's current PBP policy to the block engine (best-effort).
