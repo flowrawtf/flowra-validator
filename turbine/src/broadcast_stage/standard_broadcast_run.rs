@@ -8,6 +8,7 @@ use {
     crate::{ShredReceiverAddresses, cluster_nodes::ClusterNodesCache},
     agave_votor::event::VotorEventSender,
     agave_votor_messages::{consensus_message::Block, migration::MigrationStatus},
+    solana_clock::BankId,
     solana_cost_model::shred_limit::{
         DEFAULT_MAX_CODE_SHREDS_PER_SLOT, DEFAULT_MAX_DATA_SHREDS_PER_SLOT,
     },
@@ -35,6 +36,8 @@ const MAX_BROADCAST_BLACKLIST_SIZE: usize = 16;
 #[derive(Clone)]
 pub struct StandardBroadcastRun {
     slot: Slot,
+    // Single-producer FIFO input keeps messages for a bank contiguous.
+    skipped_bank_id: Option<BankId>,
     // Parent encoded in shred headers. This must remain stable for the slot
     // because it is used to derive PARENT_OFFSET.
     parent: Slot,
@@ -85,6 +88,7 @@ impl StandardBroadcastRun {
         ));
         Self {
             slot: Slot::MAX,
+            skipped_bank_id: None,
             parent: Slot::MAX,
             parent_block_id: Hash::default(),
             parent_for_double_merkle: Block {
@@ -143,6 +147,7 @@ impl StandardBroadcastRun {
         let Some(parent_bank) = bank.parent() else {
             // If our broadcast is quite backed up, the parent bank could have already been
             // pruned from BankForks by a newer window getting rooted
+            self.skipped_bank_id = Some(bank.bank_id());
             return Err(Error::WindowSkipped(bank.slot()));
         };
         debug_assert!(parent_bank.is_frozen());
@@ -368,14 +373,14 @@ impl StandardBroadcastRun {
             bank,
             last_tick_height,
         } = receive_results;
+        let slot = bank.slot();
+        if self.skipped_bank_id == Some(bank.bank_id()) || self.is_broadcast_blacklisted(slot) {
+            return Ok(());
+        }
         let component = match item {
             BroadcastItem::SlotStart => None,
             BroadcastItem::Component(component) => Some(component),
         };
-
-        if self.is_broadcast_blacklisted(bank.slot()) {
-            return Ok(());
-        }
 
         if self.is_broadcast_blacklisted(bank.parent_slot()) {
             self.blacklist_broadcast_slot(bank.slot());
@@ -682,11 +687,25 @@ impl BroadcastRun for StandardBroadcastRun {
         socket_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
         blockstore_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
     ) -> Result<()> {
+        // Drain the skipped bank before recv_slot_components serializes its entries.
+        while let Some(skipped_bank_id) = self.skipped_bank_id {
+            let message = match self.carryover_message.take() {
+                Some(message) => message,
+                None => receiver.recv_timeout(Duration::from_secs(1))?,
+            };
+            if message.0.bank_id() != skipped_bank_id {
+                // FIFO input keeps messages for a bank contiguous.
+                self.carryover_message = Some(message);
+                self.skipped_bank_id = None;
+            }
+        }
+
         let mut process_stats = ProcessShredsStats::default();
         let receive_results = broadcast_utils::recv_slot_components(
             receiver,
             &mut self.carryover_message,
             &mut process_stats,
+            self.slot,
         )?;
         // TODO: Confirm that last chunk of coding shreds
         // will not be lost or delayed for too long.
@@ -752,7 +771,7 @@ mod test {
         super::*,
         assert_matches::assert_matches,
         rand::Rng,
-        solana_entry::entry::create_ticks,
+        solana_entry::{entry::create_ticks, recorder_message::RecorderMessage},
         solana_genesis_config::GenesisConfig,
         solana_gossip::{cluster_info::ClusterInfo, node::Node},
         solana_hash::Hash,
@@ -1440,6 +1459,64 @@ mod test {
         assert!(!standard_broadcast_run.is_broadcast_blacklisted(2));
         assert!(standard_broadcast_run.is_broadcast_blacklisted(3));
         assert!(standard_broadcast_run.is_broadcast_blacklisted(18));
+    }
+
+    #[test]
+    fn test_window_skipped_suppresses_only_same_bank() {
+        let (blockstore, genesis_config, _, parent_bank, leader_keypair, _, _bank_forks) = setup(2);
+        let skipped_parent = new_child_bank(&parent_bank, 1);
+        skipped_parent.set_tick_height(skipped_parent.max_tick_height());
+        Bank::calculate_and_set_block_id_for_dcou(&skipped_parent);
+        let skipped_bank = new_child_bank(&skipped_parent, 2);
+        let replacement_bank = new_child_bank(&parent_bank, 2);
+        skipped_bank.squash();
+        assert!(skipped_bank.parent().is_none());
+        assert!(replacement_bank.parent().is_some());
+
+        let (votor_event_sender, _votor_event_receiver) = bounded(1024);
+        let mut run = StandardBroadcastRun::new(
+            0,
+            Arc::new(MigrationStatus::post_migration_status()),
+            votor_event_sender,
+            test_leader_schedule_cache(&parent_bank),
+        );
+        let (shred_sender, shred_receiver) = bounded(1024);
+        let (working_sender, working_receiver) = bounded(1024);
+        let mut pinnable_slice = blockstore.new_pinnable_slice();
+        let mut write_batch = blockstore.get_write_batch().unwrap();
+        let mut process_slot_start = |bank: Arc<Bank>| {
+            working_sender
+                .send((
+                    bank.clone(),
+                    (RecorderMessage::SlotStart, bank.tick_height()),
+                ))
+                .unwrap();
+            run.run(
+                &leader_keypair,
+                &blockstore,
+                &mut pinnable_slice,
+                &mut write_batch,
+                &working_receiver,
+                &shred_sender,
+                &shred_sender,
+            )
+        };
+
+        let err = process_slot_start(skipped_bank.clone()).unwrap_err();
+        assert_matches!(err, Error::WindowSkipped(2));
+
+        let tick = create_ticks(1, 0, genesis_config.hash()).pop().unwrap();
+        working_sender
+            .send((
+                skipped_bank,
+                (tick.into(), skipped_parent.tick_height() + 1),
+            ))
+            .unwrap();
+        process_slot_start(replacement_bank).unwrap();
+
+        assert!(working_receiver.is_empty());
+        assert!(run.skipped_bank_id.is_none());
+        assert_eq!(shred_receiver.len(), 2);
     }
 
     #[test]
