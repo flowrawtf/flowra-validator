@@ -10,7 +10,7 @@ use {
             },
         },
         packet_bundle::VerifiedPacketBundle,
-        transaction_priority::transaction_tip_lamports,
+        transaction_priority::{TipAccountSet, transaction_tip_lamports},
     },
     ahash::HashSet,
     arrayvec::ArrayVec,
@@ -35,7 +35,14 @@ use {
 pub enum BundleOrdering {
     /// Arrival order. What Jito ships.
     Fifo,
-    /// Highest tip first; equal tips in arrival order.
+    /// Highest value per unit of cost first, where value is what the leader earns from the
+    /// bundle: the tips it transfers plus the fee reward its transactions pay (SIMD-0096 gives
+    /// the leader all of the priority fee, so a lamport of either is the same lamport). Equal
+    /// scores in arrival order.
+    ///
+    /// Ranking on the tip alone ignored the priority fees the leader keeps and the cost the
+    /// bundle takes to run — a bundle paying through its priority fee, or a cheap bundle with a
+    /// modest tip, waited behind a heavier one that earned less per unit of the window.
     ///
     /// The leader window, not the cost model, is what runs out on mainnet: bundles still in
     /// the buffer when the window closes are cleared, and the tip on a cleared bundle was
@@ -79,16 +86,20 @@ struct BundleTransactionId {
     /// Lamports the bundle transfers to tip accounts, summed over its transactions. Computed
     /// once at insert; always zero under [`BundleOrdering::Fifo`].
     tip_lamports: u64,
+    /// `(tips + fee reward) * 1e6 / (cost + 1)` over the whole bundle — the same scale as a
+    /// transaction's scheduler priority. The heap key under [`BundleOrdering::TipPriority`];
+    /// always zero under FIFO.
+    score: u64,
     /// Arrival sequence number; the tie-break under tip ordering.
     seq: u64,
 }
 
-/// Heap key for tip ordering: highest tip first, earliest arrival among equals.
+/// Heap key for tip ordering: highest score first, earliest arrival among equals.
 struct ByTip(BundleTransactionId);
 
 impl PartialEq for ByTip {
     fn eq(&self, other: &Self) -> bool {
-        self.0.tip_lamports == other.0.tip_lamports && self.0.seq == other.0.seq
+        self.0.score == other.0.score && self.0.seq == other.0.seq
     }
 }
 impl Eq for ByTip {}
@@ -100,8 +111,8 @@ impl PartialOrd for ByTip {
 impl Ord for ByTip {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0
-            .tip_lamports
-            .cmp(&other.0.tip_lamports)
+            .score
+            .cmp(&other.0.score)
             .then_with(|| other.0.seq.cmp(&self.0.seq))
     }
 }
@@ -178,6 +189,7 @@ pub struct BundleStorageEntry {
     sanitized_bank_id: BankId,
     sanitized_bank_slot: Slot,
     tip_lamports: u64,
+    score: u64,
     seq: u64,
 }
 
@@ -190,7 +202,7 @@ pub struct BundleStorage {
     ordering: BundleOrdering,
     /// Tip-account PDAs of every managed tip program; what a transfer must target to count as a
     /// tip. Empty under FIFO, where tips are not computed.
-    tip_accounts: std::collections::HashSet<Pubkey>,
+    tip_accounts: TipAccountSet,
     next_seq: u64,
     unprocessed_bundles: BundleQueue,
     // Storage for bundles that exceeded the cost model for the slot they were last attempted
@@ -227,7 +239,7 @@ impl BundleStorage {
                 transaction_capacity,
             ),
             ordering,
-            tip_accounts,
+            tip_accounts: TipAccountSet::new(tip_accounts),
             next_seq: 0,
             unprocessed_bundles: BundleQueue::with_capacity(ordering, transaction_capacity),
             cost_model_buffered_bundles: VecDeque::with_capacity(transaction_capacity),
@@ -343,6 +355,7 @@ impl BundleStorage {
                 sanitized_bank_id: bundle.sanitized_bank_id,
                 sanitized_bank_slot: bundle.sanitized_bank_slot,
                 tip_lamports: bundle.tip_lamports,
+                score: bundle.score,
                 seq: bundle.seq,
             });
     }
@@ -397,6 +410,7 @@ impl BundleStorage {
                 sanitized_bank_id: bundle.sanitized_bank_id,
                 sanitized_bank_slot: bundle.sanitized_bank_slot,
                 tip_lamports: bundle.tip_lamports,
+                score: bundle.score,
                 seq: bundle.seq,
             });
         }
@@ -490,18 +504,9 @@ impl BundleStorage {
             return Err(BundleStorageError::DuplicateTransaction);
         }
 
-        let tip_lamports = match self.ordering {
-            BundleOrdering::Fifo => 0,
-            BundleOrdering::TipPriority => container_ids
-                .iter()
-                .map(|id| {
-                    let transaction = self
-                        .transaction_view_state_container
-                        .get_transaction(*id)
-                        .expect("transaction must exist");
-                    transaction_tip_lamports(transaction, &self.tip_accounts)
-                })
-                .fold(0u64, u64::saturating_add),
+        let (tip_lamports, score) = match self.ordering {
+            BundleOrdering::Fifo => (0, 0),
+            BundleOrdering::TipPriority => self.bundle_value(&container_ids, working_bank),
         };
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -511,10 +516,40 @@ impl BundleStorage {
             sanitized_bank_id: working_bank.bank_id(),
             sanitized_bank_slot: working_bank.slot(),
             tip_lamports,
+            score,
             seq,
         });
 
         Ok(())
+    }
+
+    /// `(tip_lamports, score)` for a bundle already in the container; see
+    /// [`BundleTransactionId::score`].
+    fn bundle_value(&mut self, container_ids: &[usize], bank: &Bank) -> (u64, u64) {
+        const MULTIPLIER: u128 = 1_000_000;
+        let (mut tips, mut reward, mut cost) = (0u64, 0u64, 0u64);
+        for id in container_ids {
+            cost = cost.saturating_add(
+                self.transaction_view_state_container
+                    .get_mut_transaction_state(*id)
+                    .expect("transaction must exist")
+                    .cost(),
+            );
+            let transaction = self
+                .transaction_view_state_container
+                .get_transaction(*id)
+                .expect("transaction must exist");
+            tips = tips.saturating_add(transaction_tip_lamports(transaction, &self.tip_accounts));
+            // Already validated at insert; a transaction whose budget cannot be read simply
+            // contributes no fee.
+            if let Ok(configuration) = transaction.transaction_configuration(&bank.feature_set) {
+                reward = reward
+                    .saturating_add(bank.calculate_reward_for_transaction(transaction, &configuration));
+            }
+        }
+        let value = u128::from(tips.saturating_add(reward));
+        let score = value.saturating_mul(MULTIPLIER) / u128::from(cost.saturating_add(1));
+        (tips, u64::try_from(score).unwrap_or(u64::MAX))
     }
 
     fn does_contain_duplicate_hashes(&self, container_ids: &[usize]) -> bool {
@@ -763,6 +798,81 @@ mod tests {
             ]
         );
         assert_eq!(storage.num_packets_buffered(), 0);
+    }
+
+    /// A transfer to `to`, preceded by compute-budget instructions when given.
+    fn budget_tx(
+        payer: &Keypair,
+        to: &Pubkey,
+        lamports: u64,
+        cu_limit: Option<u32>,
+        cu_price: Option<u64>,
+    ) -> Transaction {
+        use solana_compute_budget_interface::ComputeBudgetInstruction;
+        let mut ixs = Vec::new();
+        if let Some(limit) = cu_limit {
+            ixs.push(ComputeBudgetInstruction::set_compute_unit_limit(limit));
+        }
+        if let Some(price) = cu_price {
+            ixs.push(ComputeBudgetInstruction::set_compute_unit_price(price));
+        }
+        ixs.push(solana_system_interface::instruction::transfer(
+            &payer.pubkey(),
+            to,
+            lamports,
+        ));
+        Transaction::new_signed_with_payer(&ixs, Some(&payer.pubkey()), &[payer], Hash::default())
+    }
+
+    #[test]
+    fn test_tip_priority_counts_the_priority_fee() {
+        let bank = Bank::new_for_tests(&GenesisConfig::default());
+        let tip_account = Pubkey::new_unique();
+        let mut storage = tip_storage(tip_account);
+
+        // Same budget; one pays a 1_000-lamport tip, the other no tip but a 10_000-lamport
+        // priority fee (10_000 CU at 1_000_000 micro-lamports). The leader earns more from the
+        // second, so it goes first even though its tip is zero.
+        let tipped = budget_tx(&Keypair::new(), &tip_account, 1_000, Some(10_000), None);
+        let fee_paying = budget_tx(
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            1,
+            Some(10_000),
+            Some(1_000_000),
+        );
+        for tx in [&tipped, &fee_paying] {
+            storage
+                .insert_bundle(bundle_of(tx.clone()), &bank, &bank, &HashSet::new())
+                .unwrap();
+        }
+
+        assert_eq!(
+            pop_all(&mut storage, bank.slot(), bank.bank_id()),
+            vec![fee_paying.signatures[0], tipped.signatures[0]]
+        );
+    }
+
+    #[test]
+    fn test_tip_priority_ranks_per_unit_of_cost() {
+        let bank = Bank::new_for_tests(&GenesisConfig::default());
+        let tip_account = Pubkey::new_unique();
+        let mut storage = tip_storage(tip_account);
+
+        // Equal tips; the heavy bundle requests the default 200k CU per instruction, the light
+        // one 1_000. Per unit of the window the light one is worth far more.
+        let heavy = budget_tx(&Keypair::new(), &tip_account, 1_000, None, None);
+        let light = budget_tx(&Keypair::new(), &tip_account, 1_000, Some(1_000), None);
+        for tx in [&heavy, &light] {
+            storage
+                .insert_bundle(bundle_of(tx.clone()), &bank, &bank, &HashSet::new())
+                .unwrap();
+        }
+
+        assert_eq!(
+            pop_all(&mut storage, bank.slot(), bank.bank_id()),
+            vec![light.signatures[0], heavy.signatures[0]]
+        );
     }
 
     #[test]
