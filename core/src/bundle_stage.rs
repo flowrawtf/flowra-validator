@@ -111,6 +111,10 @@ pub struct BundleStageLoopMetrics {
     // load was spent on them.
     num_bundles_pruned_stale_blockhash: Saturating<u64>,
     num_bundles_pruned_already_processed: Saturating<u64>,
+    // Time the prune takes. It runs on this thread at the start of every leader bank, so
+    // every microsecond here is a microsecond before the slot's first bundle executes.
+    prune_us: Saturating<u64>,
+    prune_max_us: u64,
 
     // `num_bundles_dropped_packet_filter_error` split by which check failed. A searcher whose
     // bundles all die at the filter is indistinguishable from any other drop without this.
@@ -160,6 +164,8 @@ impl Default for BundleStageLoopMetrics {
             num_bundles_error_non_retryable: Saturating(0),
             num_bundles_pruned_stale_blockhash: Saturating(0),
             num_bundles_pruned_already_processed: Saturating(0),
+            prune_us: Saturating(0),
+            prune_max_us: 0,
             num_bundles_dropped_pf_sanitization: Saturating(0),
             num_bundles_dropped_pf_lock_validation: Saturating(0),
             num_bundles_dropped_pf_compute_budget: Saturating(0),
@@ -234,9 +240,11 @@ impl BundleStageLoopMetrics {
         self.num_bundles_error_non_retryable += 1;
     }
 
-    pub fn increment_bundles_pruned(&mut self, stats: PruneStats) {
+    pub fn increment_bundles_pruned(&mut self, stats: PruneStats, elapsed_us: u64) {
         self.num_bundles_pruned_stale_blockhash += stats.stale_blockhash;
         self.num_bundles_pruned_already_processed += stats.already_processed;
+        self.prune_us += elapsed_us;
+        self.prune_max_us = self.prune_max_us.max(elapsed_us);
     }
 
     /// Name the limit when the cost model refused a bundle. `BundleConsumer` marks the
@@ -436,6 +444,8 @@ impl BundleStageLoopMetrics {
                     self.num_bundles_pruned_already_processed.0 as i64,
                     i64
                 ),
+                ("prune_us", self.prune_us.0 as i64, i64),
+                ("prune_max_us", self.prune_max_us as i64, i64),
                 (
                     "num_bundles_dropped_pf_sanitization",
                     self.num_bundles_dropped_pf_sanitization.0 as i64,
@@ -515,6 +525,8 @@ impl BundleStageLoopMetrics {
         self.num_bundles_error_non_retryable = Saturating(0);
         self.num_bundles_pruned_stale_blockhash = Saturating(0);
         self.num_bundles_pruned_already_processed = Saturating(0);
+        self.prune_us = Saturating(0);
+        self.prune_max_us = 0;
         self.num_bundles_dropped_pf_sanitization = Saturating(0);
         self.num_bundles_dropped_pf_lock_validation = Saturating(0);
         self.num_bundles_dropped_pf_compute_budget = Saturating(0);
@@ -927,7 +939,8 @@ impl BundleStage {
         }
 
         // Clear out what this bank would reject anyway, so the window opens on live bundles.
-        bundle_stage_metrics.increment_bundles_pruned(bundle_storage.prune_stale(bank));
+        let (prune_stats, prune_us) = measure_us!(bundle_storage.prune_stale(bank));
+        bundle_stage_metrics.increment_bundles_pruned(prune_stats, prune_us);
 
         // This loop shall:
         // - Pop a bundle from the bundle storage
