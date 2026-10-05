@@ -12,13 +12,54 @@ use {
     solana_sdk_ids::system_program,
     solana_svm_transaction::svm_message::SVMStaticMessage,
     solana_transaction::sanitized::MessageHash,
-    std::{collections::HashSet, sync::OnceLock},
+    std::sync::OnceLock,
 };
 
 /// FLOWRA PoC: process-global set of tip-payment PDAs used by the optional
 /// tip-aware priority calculation. Populated once at validator boot where the
 /// `TipManager` is constructed.
-static TIP_ACCOUNTS: OnceLock<HashSet<Pubkey>> = OnceLock::new();
+static TIP_ACCOUNTS: OnceLock<TipAccountSet> = OnceLock::new();
+
+/// The tip-payment PDAs of every managed tip program: a handful of keys (8 per program),
+/// probed once per static account key of every transaction the scheduler receives.
+///
+/// A `HashSet<Pubkey>` hashes all 32 bytes with SipHash for every probe, which is most of
+/// the cost of parsing a tip. With this few members a linear scan over the first 8 bytes
+/// of each key is cheaper, and a full compare only runs on a prefix match (pubkeys are
+/// uniformly distributed, so a false prefix match is effectively never).
+#[derive(Clone, Debug, Default)]
+pub struct TipAccountSet {
+    prefixes: Vec<u64>,
+    keys: Vec<Pubkey>,
+}
+
+impl TipAccountSet {
+    pub fn new(accounts: impl IntoIterator<Item = Pubkey>) -> Self {
+        let mut keys: Vec<Pubkey> = accounts.into_iter().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let prefixes = keys.iter().map(Self::prefix).collect();
+        Self { prefixes, keys }
+    }
+
+    #[inline]
+    fn prefix(key: &Pubkey) -> u64 {
+        u64::from_le_bytes(key.as_ref()[..8].try_into().unwrap())
+    }
+
+    #[inline]
+    pub fn contains(&self, key: &Pubkey) -> bool {
+        let prefix = Self::prefix(key);
+        self.prefixes
+            .iter()
+            .zip(&self.keys)
+            .any(|(p, k)| *p == prefix && k == key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+}
 
 /// Returns true if tip-aware priority is enabled via
 /// `FLOWRA_TIP_AWARE_PRIORITY=1`. The env check is cached after first use.
@@ -31,7 +72,7 @@ fn tip_aware_priority_enabled() -> bool {
 /// FLOWRA PoC: register the tip-payment PDAs for tip-aware priority.
 /// Subsequent calls are no-ops.
 pub fn set_tip_accounts(tip_accounts: impl IntoIterator<Item = Pubkey>) {
-    let tip_accounts: HashSet<Pubkey> = tip_accounts.into_iter().collect();
+    let tip_accounts = TipAccountSet::new(tip_accounts);
     let num_tip_accounts = tip_accounts.len();
     if TIP_ACCOUNTS.set(tip_accounts).is_ok() && tip_aware_priority_enabled() {
         info!("FLOWRA tip-aware priority: enabled ({num_tip_accounts} tip accounts)");
@@ -49,7 +90,7 @@ pub fn set_tip_accounts(tip_accounts: impl IntoIterator<Item = Pubkey>) {
 /// PDAs are a small, well-known set that senders pass directly.
 pub(crate) fn transaction_tip_lamports(
     transaction: &impl SVMStaticMessage,
-    tip_accounts: &HashSet<Pubkey>,
+    tip_accounts: &TipAccountSet,
 ) -> u64 {
     let account_keys = transaction.static_account_keys();
     // Quick check: only walk instructions if a tip account is present at all.
@@ -333,6 +374,20 @@ mod tests {
             calculate_priority_and_cost(&bank, &runtime_tx, &transaction_configuration);
 
         assert_eq!(from_bytes, from_typed);
+    }
+
+    #[test]
+    fn test_tip_account_set_matches_members_only() {
+        let members: Vec<Pubkey> = (0..16).map(|_| Pubkey::new_unique()).collect();
+        let set = TipAccountSet::new(members.iter().copied().chain(members.iter().copied()));
+        assert_eq!(set.len(), 16, "duplicates collapse");
+        assert!(members.iter().all(|k| set.contains(k)));
+        assert!((0..1_000).all(|_| !set.contains(&Pubkey::new_unique())));
+
+        // Same leading 8 bytes, different key: only the full compare can tell them apart.
+        let mut bytes = members[0].to_bytes();
+        bytes[31] ^= 1;
+        assert!(!set.contains(&Pubkey::new_from_array(bytes)));
     }
 
     #[test]
