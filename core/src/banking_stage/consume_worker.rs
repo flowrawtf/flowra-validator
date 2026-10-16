@@ -3990,10 +3990,7 @@ mod tests {
         let records: Vec<_> = frame.record_receiver.drain().collect();
         assert!(!records.is_empty());
         assert!(records.iter().all(|r| !r.reschedule_on_sad_handover));
-        let recorded: Vec<_> = records
-            .into_iter()
-            .flat_map(|r| r.transactions)
-            .collect();
+        let recorded: Vec<_> = records.into_iter().flat_map(|r| r.transactions).collect();
         assert_eq!(recorded.len(), crank.len());
         assert!(recorded.iter().all(|tx| tx.signatures[0] != signature));
         let prepared_cost = block_costs(&bank).0 - estimate;
@@ -4200,7 +4197,13 @@ mod tests {
         let signature = enqueue(
             &mut container,
             &tips.cluster_info.keypair(),
-            *tips.tip_managers.primary().get_tip_accounts().iter().next().unwrap(),
+            *tips
+                .tip_managers
+                .primary()
+                .get_tip_accounts()
+                .iter()
+                .next()
+                .unwrap(),
             1,
         );
         if let Some(work) = old_work {

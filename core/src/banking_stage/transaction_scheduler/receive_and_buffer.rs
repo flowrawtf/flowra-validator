@@ -138,7 +138,9 @@ fn cap_unfunded_tip(bank: &Bank, state: &mut TransactionViewState) {
         transaction_configuration.priority_fee_lamports,
         bank.fee_features(),
     );
-    let spendable = bank.get_balance(transaction.fee_payer()).saturating_sub(fee);
+    let spendable = bank
+        .get_balance(transaction.fee_payer())
+        .saturating_sub(fee);
     if spendable >= tip {
         return;
     }

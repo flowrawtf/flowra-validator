@@ -1286,17 +1286,17 @@ impl BundleStage {
 mod tests {
     use {
         super::*,
-        crate::tip_manager::{
-            TipDistributionAccountConfig, TipManagerConfig,
-            tip_distribution::{JitoTipDistributionConfig, TipDistributionAccount},
-            tip_payment::JitoTipPaymentConfig,
-        },
         crate::{
             banking_stage::{
                 consumer::{ExecuteAndCommitTransactionsOutput, LeaderProcessedTransactionCounts},
                 leader_slot_timing_metrics::LeaderExecuteAndCommitTimings,
             },
             bundle_stage::bundle_storage::BundleStorageError,
+            tip_manager::{
+                TipDistributionAccountConfig, TipManagerConfig,
+                tip_distribution::{JitoTipDistributionConfig, TipDistributionAccount},
+                tip_payment::JitoTipPaymentConfig,
+            },
         },
         agave_feature_set::FeatureSet,
         crossbeam_channel::{bounded, unbounded},
