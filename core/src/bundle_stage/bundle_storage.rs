@@ -543,8 +543,9 @@ impl BundleStorage {
             // Already validated at insert; a transaction whose budget cannot be read simply
             // contributes no fee.
             if let Ok(configuration) = transaction.transaction_configuration(&bank.feature_set) {
-                reward = reward
-                    .saturating_add(bank.calculate_reward_for_transaction(transaction, &configuration));
+                reward = reward.saturating_add(
+                    bank.calculate_reward_for_transaction(transaction, &configuration),
+                );
             }
         }
         let value = u128::from(tips.saturating_add(reward));

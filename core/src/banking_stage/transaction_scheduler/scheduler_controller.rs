@@ -318,19 +318,21 @@ where
                     // to the slot's end, and the block can never use its whole limit.
                     // Clamp to the slot less the margin, and pace this slot with the
                     // clamped value, not the one read before clamping.
-                    let fill_time =
-                        effective_fill_time(self.config.scheduler_pacing.fill_time(), b.ns_per_slot);
+                    let fill_time = effective_fill_time(
+                        self.config.scheduler_pacing.fill_time(),
+                        b.ns_per_slot,
+                    );
                     if fill_time != self.config.scheduler_pacing.fill_time() {
                         warn!(
                             "scheduler pacing config pacing_fill_time {:?} leaves less than \
-                             {DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS}ms of the bank's \
-                             slot time {}ns, using {:?}",
+                             {DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS}ms of the bank's slot \
+                             time {}ns, using {:?}",
                             self.config.scheduler_pacing.fill_time(),
                             b.ns_per_slot,
                             fill_time,
                         );
-                        if let Some(clamped) = fill_time
-                            .and_then(|f| NonZeroU64::new(f.as_millis() as u64))
+                        if let Some(clamped) =
+                            fill_time.and_then(|f| NonZeroU64::new(f.as_millis() as u64))
                         {
                             self.config.scheduler_pacing = SchedulerPacing::FillTimeMillis(clamped);
                         }

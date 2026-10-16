@@ -238,9 +238,9 @@ pub(crate) fn priority_tip_lamports(transaction: &impl SVMStaticMessage) -> u64 
     if !tip_aware_priority_enabled() {
         return 0;
     }
-    TIP_ACCOUNTS
-        .get()
-        .map_or(0, |tip_accounts| payer_tip_lamports(transaction, tip_accounts))
+    TIP_ACCOUNTS.get().map_or(0, |tip_accounts| {
+        payer_tip_lamports(transaction, tip_accounts)
+    })
 }
 
 /// [`calculate_priority_and_cost`] counting at most `tip_cap` of the tip, for a fee payer
