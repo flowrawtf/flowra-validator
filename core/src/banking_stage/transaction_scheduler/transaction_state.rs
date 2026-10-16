@@ -43,6 +43,12 @@ impl<Tx> TransactionState<Tx> {
         self.priority
     }
 
+    /// Replace the priority, for a value that could only be settled after the initial
+    /// calculation (see `precheck_transaction`).
+    pub(crate) fn set_priority(&mut self, priority: u64) {
+        self.priority = priority;
+    }
+
     /// Return the cost of the transaction.
     pub(crate) fn cost(&self) -> u64 {
         self.cost
