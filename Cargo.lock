@@ -559,13 +559,13 @@ dependencies = [
 name = "agave-votor-transport"
 version = "4.3.0"
 dependencies = [
+ "anza-quinn",
+ "anza-quinn-proto",
  "arrayvec",
  "bytes",
  "crossbeam-channel",
  "log",
  "qualifier_attr",
- "quinn",
- "quinn-proto",
  "solana-keypair",
  "solana-metrics",
  "solana-net-utils",
@@ -791,6 +791,49 @@ name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
+name = "anza-quinn"
+version = "0.11.11-rustsec20260339"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a62d8ecfb26bf248d342b063ed75562a96de59cce217dd644753b16894d5eece"
+dependencies = [
+ "anza-quinn-proto",
+ "bytes",
+ "cfg_aliases",
+ "pin-project-lite",
+ "quinn-udp",
+ "rustc-hash",
+ "rustls",
+ "socket2 0.6.5",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "anza-quinn-proto"
+version = "0.11.15-rustsec20260339"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dee5c3a4af54f60eed3d9f5e0ed935a1a3b988a857c115fac60de86ebf31dbec"
+dependencies = [
+ "bytes",
+ "fastbloom",
+ "getrandom 0.3.4",
+ "lru-slab",
+ "rand 0.9.4",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-platform-verifier",
+ "slab",
+ "thiserror 2.0.19",
+ "tinyvec",
+ "tracing",
+ "web-time",
+]
 
 [[package]]
 name = "arbitrary"
@@ -6034,7 +6077,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "bytes",
- "fastbloom",
  "getrandom 0.3.4",
  "lru-slab",
  "rand 0.9.4",
@@ -6042,7 +6084,6 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "rustls-pki-types",
- "rustls-platform-verifier",
  "slab",
  "thiserror 2.0.19",
  "tinyvec",
@@ -10200,12 +10241,12 @@ name = "solana-quic-client"
 version = "4.3.0"
 dependencies = [
  "agave-logger",
+ "anza-quinn",
  "async-lock",
  "async-trait",
  "crossbeam-channel",
  "futures 0.3.33",
  "log",
- "quinn",
  "solana-connection-cache",
  "solana-keypair",
  "solana-measure",
@@ -11186,6 +11227,7 @@ dependencies = [
  "agave-logger",
  "agave-xdp",
  "anyhow",
+ "anza-quinn",
  "assert_matches",
  "bytes",
  "chrono",
@@ -11199,7 +11241,6 @@ dependencies = [
  "nix",
  "num_cpus",
  "pem 1.1.1",
- "quinn",
  "rand 0.9.4",
  "rustls",
  "smallvec",
@@ -11658,7 +11699,7 @@ dependencies = [
 name = "solana-tls-utils"
 version = "4.3.0"
 dependencies = [
- "quinn",
+ "anza-quinn",
  "rustls",
  "solana-keypair",
  "solana-pubkey 4.3.0",
@@ -11749,6 +11790,7 @@ dependencies = [
 name = "solana-tpu-client-next"
 version = "4.3.0"
 dependencies = [
+ "anza-quinn",
  "async-trait",
  "bytes",
  "crossbeam-channel",
@@ -11756,7 +11798,6 @@ dependencies = [
  "futures-util",
  "log",
  "lru 0.18.2",
- "quinn",
  "rustls",
  "serde_json",
  "solana-clock",
