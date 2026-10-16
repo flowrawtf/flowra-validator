@@ -575,6 +575,28 @@ pub struct BundleStage {
     bundle_thread: JoinHandle<()>,
 }
 
+/// What one round of tip-program maintenance means for the bundles waiting on a bank.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TipCrankOutcome {
+    failures: usize,
+    /// The primary (our own) program failed in a way that can succeed on a later poll.
+    primary_retryable: bool,
+}
+
+impl TipCrankOutcome {
+    fn record_failure(&mut self, primary: bool, error: &BundleExecutionError) {
+        self.failures += 1;
+        if primary && matches!(error, BundleExecutionError::ErrorRetryable) {
+            self.primary_retryable = true;
+        }
+    }
+
+    /// Hold bundles while our own program's crank can still succeed in this slot.
+    fn hold_bundles(&self) -> bool {
+        self.primary_retryable
+    }
+}
+
 impl BundleStage {
     #[allow(clippy::new_ret_no_self)]
     #[allow(clippy::too_many_arguments)]
@@ -914,7 +936,7 @@ impl BundleStage {
         let mut bundles = VecDeque::with_capacity(BUNDLE_WINDOW_SIZE.get());
 
         if bank.slot() != *last_tip_update_slot {
-            let failures = Self::handle_tip_programs(
+            let outcome = Self::handle_tip_programs(
                 bank,
                 bundle_account_locker,
                 consumer,
@@ -923,13 +945,17 @@ impl BundleStage {
                 block_builder_fee_info,
                 consume_worker_metrics,
             );
-            if failures > 0 {
-                bundle_stage_metrics.increment_tip_programs_error(failures as u64);
-                // Do NOT return — tip programs may not exist on devnet/testnet, and an
-                // upstream program we cannot crank must not stop us building the block.
-                // Bundles are still valid and should be processed.
+            if outcome.failures > 0 {
+                bundle_stage_metrics.increment_tip_programs_error(outcome.failures as u64);
             }
-
+            if outcome.hold_bundles() {
+                // Our own program's crank can still succeed this slot. Bundles run now would
+                // tip PDAs whose receiver still names the previous leader, and the next
+                // successful crank would pay those tips out to it. Retry on the next poll.
+                return;
+            }
+            // Anything else (missing programs on devnet/testnet, an upstream program we do
+            // not control) will not succeed on retry and must not stop us building the block.
             *last_tip_update_slot = bank.slot();
         }
 
@@ -1035,23 +1061,24 @@ impl BundleStage {
         cluster_info: &Arc<ClusterInfo>,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         consume_worker_metrics: &ConsumeWorkerMetrics,
-    ) -> usize {
+    ) -> TipCrankOutcome {
         // Tip programs fund PDAs with Rent::get().minimum_balance(). When rent is
         // free (local-cluster), that is 0 lamports and accounts-db drops the
         // accounts, so init/crank can never succeed. Skip instead of retrying
         // doomed work every poll.
         if bank.rent_collector().rent.minimum_balance(0) == 0 {
             debug!("skipping tip program init/crank because rent is free");
-            return 0;
+            return TipCrankOutcome::default();
         }
         let keypair = cluster_info.keypair();
         let bb_info = block_builder_fee_info.load();
-        let mut failures = 0usize;
+        let mut outcome = TipCrankOutcome::default();
 
         // Programs are cranked independently: a program we cannot crank (wrong config, an
         // upstream program we do not fully control) must not stop us cranking the others.
-        for tip_manager in tip_managers.iter() {
+        for (index, tip_manager) in tip_managers.iter().enumerate() {
             let program = tip_manager.tip_payment_program_id();
+            let primary = index == 0;
 
             if let Err(e) = Self::handle_initialize_tip_programs(
                 bank,
@@ -1062,7 +1089,7 @@ impl BundleStage {
                 &keypair,
             ) {
                 warn!("tip program {program} initialize failed: {e:?}");
-                failures += 1;
+                outcome.record_failure(primary, &e);
                 continue;
             }
 
@@ -1070,7 +1097,7 @@ impl BundleStage {
                 Ok(steps) => steps,
                 Err(e) => {
                     warn!("tip program {program} crank could not be built: {e:?}");
-                    failures += 1;
+                    outcome.failures += 1;
                     continue;
                 }
             };
@@ -1106,7 +1133,7 @@ impl BundleStage {
                                 .execute_and_commit_transactions_output
                                 .commit_transactions_result
                         );
-                        failures += 1;
+                        outcome.record_failure(primary, &e);
                         if step.blocking {
                             // Later steps read what this one was supposed to write.
                             break;
@@ -1116,7 +1143,7 @@ impl BundleStage {
             }
         }
 
-        failures
+        outcome
     }
 
     fn handle_initialize_tip_programs(
@@ -1645,6 +1672,25 @@ mod tests {
             bam_enabled.load(Ordering::Acquire),
             BamConnectionState::Connected as u8
         );
+    }
+
+    #[test]
+    fn test_retryable_primary_crank_failure_holds_bundles() {
+        let mut outcome = TipCrankOutcome::default();
+        outcome.record_failure(true, &BundleExecutionError::ErrorRetryable);
+        assert_eq!(outcome.failures, 1);
+        assert!(outcome.hold_bundles());
+    }
+
+    #[test]
+    fn test_crank_failures_that_cannot_succeed_this_slot_do_not_hold_bundles() {
+        let mut outcome = TipCrankOutcome::default();
+        // An upstream program we cannot crank, even transiently.
+        outcome.record_failure(false, &BundleExecutionError::ErrorRetryable);
+        // Our own program failing for good (e.g. not deployed on this cluster).
+        outcome.record_failure(true, &BundleExecutionError::ErrorNonRetryable);
+        assert_eq!(outcome.failures, 2);
+        assert!(!outcome.hold_bundles());
     }
 
     #[test]
