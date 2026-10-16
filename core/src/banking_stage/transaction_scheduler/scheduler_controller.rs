@@ -80,6 +80,17 @@ impl Default for SchedulerConfig {
 }
 
 const DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS: u64 = 50;
+
+/// The fill time pacing should use for a slot of `ns_per_slot`: the configured one, but never
+/// closer than [`DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS`] to the end of the slot.
+fn effective_fill_time(configured: Option<Duration>, ns_per_slot: u128) -> Option<Duration> {
+    let configured = configured?;
+    let slot_ms = (ns_per_slot / 1_000_000) as u64;
+    let max_fill_ms = slot_ms
+        .saturating_sub(DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS)
+        .max(1);
+    Some(configured.min(Duration::from_millis(max_fill_ms)))
+}
 pub(crate) const DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS: NonZeroU64 =
     NonZeroU64::new(DEFAULT_MS_PER_SLOT - DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS).unwrap();
 
@@ -312,24 +323,28 @@ where
                     let shared_block_cost = cost_tracker.shared_block_cost();
                     drop(cost_tracker);
 
-                    // If pacing_fill_time is greater than the bank's slot time,
-                    // adjust the pacing_fill_time to be the slot time, and warn.
-                    let fill_time = self.config.scheduler_pacing.fill_time();
-                    if let Some(pacing_fill_time) = fill_time.as_ref()
-                        && pacing_fill_time.as_nanos() > b.ns_per_slot
-                    {
+                    // The fill time must leave the block time to finish inside its slot.
+                    // Upstream only clamps a fill time longer than the slot, so a fill
+                    // time equal to it (or within the non-fill margin of it) runs right
+                    // to the slot's end, and the block can never use its whole limit.
+                    // Clamp to the slot less the margin, and pace this slot with the
+                    // clamped value, not the one read before clamping.
+                    let fill_time =
+                        effective_fill_time(self.config.scheduler_pacing.fill_time(), b.ns_per_slot);
+                    if fill_time != self.config.scheduler_pacing.fill_time() {
                         warn!(
-                            "scheduler pacing config pacing_fill_time {:?} is greater than the \
-                             bank's slot time {}, setting to slot time",
-                            pacing_fill_time, b.ns_per_slot,
+                            "scheduler pacing config pacing_fill_time {:?} leaves less than \
+                             {DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS}ms of the bank's \
+                             slot time {}ns, using {:?}",
+                            self.config.scheduler_pacing.fill_time(),
+                            b.ns_per_slot,
+                            fill_time,
                         );
-                        self.config.scheduler_pacing = SchedulerPacing::FillTimeMillis(
-                            NonZeroU64::new(
-                                (b.ns_per_slot as u64 / 1_000_000)
-                                    .saturating_sub(DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS),
-                            )
-                            .unwrap_or(NonZeroU64::new(1).unwrap()),
-                        );
+                        if let Some(clamped) = fill_time
+                            .and_then(|f| NonZeroU64::new(f.as_millis() as u64))
+                        {
+                            self.config.scheduler_pacing = SchedulerPacing::FillTimeMillis(clamped);
+                        }
                     }
 
                     CostPacer {
@@ -1053,6 +1068,21 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn test_effective_fill_time_leaves_the_non_fill_margin() {
+        let ms = Duration::from_millis;
+        let slot = |millis: u128| millis * 1_000_000;
+        // 200ms slots: a 200ms fill time would run to the slot's end; stock gets 150ms.
+        assert_eq!(effective_fill_time(Some(ms(200)), slot(200)), Some(ms(150)));
+        assert_eq!(effective_fill_time(Some(ms(350)), slot(200)), Some(ms(150)));
+        // 250ms slots: 200ms already leaves the margin and is kept.
+        assert_eq!(effective_fill_time(Some(ms(200)), slot(250)), Some(ms(200)));
+        assert_eq!(effective_fill_time(Some(ms(120)), slot(200)), Some(ms(120)));
+        // Disabled pacing stays disabled; tiny slots never yield a zero fill time.
+        assert_eq!(effective_fill_time(None, slot(200)), None);
+        assert_eq!(effective_fill_time(Some(ms(200)), slot(40)), Some(ms(1)));
     }
 
     #[test]
