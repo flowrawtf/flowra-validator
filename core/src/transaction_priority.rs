@@ -92,6 +92,23 @@ pub(crate) fn transaction_tip_lamports(
     transaction: &impl SVMStaticMessage,
     tip_accounts: &TipAccountSet,
 ) -> u64 {
+    tip_lamports(transaction, tip_accounts, false)
+}
+
+/// Tip lamports a transaction's fee payer sends to a tip account.
+///
+/// This is what priority may count. A transfer from any other account says nothing about
+/// what the sender can pay, and the fee payer is the only account the scheduler checks
+/// before execution.
+fn payer_tip_lamports(transaction: &impl SVMStaticMessage, tip_accounts: &TipAccountSet) -> u64 {
+    tip_lamports(transaction, tip_accounts, true)
+}
+
+fn tip_lamports(
+    transaction: &impl SVMStaticMessage,
+    tip_accounts: &TipAccountSet,
+    payer_only: bool,
+) -> u64 {
     let account_keys = transaction.static_account_keys();
     // Quick check: only walk instructions if a tip account is present at all.
     if !account_keys.iter().any(|key| tip_accounts.contains(key)) {
@@ -110,6 +127,10 @@ pub(crate) fn transaction_tip_lamports(
             if data.len() < TRANSFER_DATA_LEN
                 || u32::from_le_bytes(data[0..4].try_into().unwrap()) != TRANSFER_DISCRIMINANT
             {
+                return None;
+            }
+            // Source is the first account of the transfer; the fee payer is account 0.
+            if payer_only && *instruction.accounts.first()? != 0 {
                 return None;
             }
             // Destination is the second account of the transfer.
@@ -209,6 +230,27 @@ pub(crate) fn calculate_priority_and_cost<Tx: TransactionMeta + SVMStaticMessage
     transaction: &Tx,
     transaction_configuration: &TransactionConfiguration,
 ) -> (u64, u64) {
+    calculate_priority_and_cost_with_tip_cap(bank, transaction, transaction_configuration, u64::MAX)
+}
+
+/// Tip lamports that priority counts for `transaction`: 0 unless tip-aware priority is on.
+pub(crate) fn priority_tip_lamports(transaction: &impl SVMStaticMessage) -> u64 {
+    if !tip_aware_priority_enabled() {
+        return 0;
+    }
+    TIP_ACCOUNTS
+        .get()
+        .map_or(0, |tip_accounts| payer_tip_lamports(transaction, tip_accounts))
+}
+
+/// [`calculate_priority_and_cost`] counting at most `tip_cap` of the tip, for a fee payer
+/// that cannot fund all of what it claims to tip.
+pub(crate) fn calculate_priority_and_cost_with_tip_cap<Tx: TransactionMeta + SVMStaticMessage>(
+    bank: &Bank,
+    transaction: &Tx,
+    transaction_configuration: &TransactionConfiguration,
+    tip_cap: u64,
+) -> (u64, u64) {
     let cost = CostModel::calculate_cost_for_executed_transaction(
         transaction,
         u64::from(transaction_configuration.compute_unit_limit),
@@ -229,11 +271,9 @@ pub(crate) fn calculate_priority_and_cost<Tx: TransactionMeta + SVMStaticMessage
     // FLOWRA PoC: fold MEV tip lamports into the priority numerator when
     // `FLOWRA_TIP_AWARE_PRIORITY=1`. Off (unset/other) leaves the priority
     // calculation byte-identical to stock behavior.
-    if tip_aware_priority_enabled() {
-        if let Some(tip_accounts) = TIP_ACCOUNTS.get() {
-            let tip = transaction_tip_lamports(transaction, tip_accounts);
-            reward = apply_tip(reward, tip);
-        }
+    let tip = priority_tip_lamports(transaction).min(tip_cap);
+    if tip > 0 {
+        reward = apply_tip(reward, tip);
     }
 
     // We need a multiplier here to avoid rounding down too aggressively.
@@ -388,6 +428,28 @@ mod tests {
         let mut bytes = members[0].to_bytes();
         bytes[31] ^= 1;
         assert!(!set.contains(&Pubkey::new_from_array(bytes)));
+    }
+
+    #[test]
+    fn test_priority_counts_only_tips_the_fee_payer_sends() {
+        let tip_account = Pubkey::new_unique();
+        let tip_accounts = TipAccountSet::new([tip_account]);
+        let payer = Keypair::new();
+        let other = Keypair::new();
+        let message = Message::new(
+            &[
+                system_instruction::transfer(&payer.pubkey(), &tip_account, 7),
+                system_instruction::transfer(&other.pubkey(), &tip_account, 1_000_000_000),
+            ],
+            Some(&payer.pubkey()),
+        );
+        let tx = Transaction::new(&[&payer, &other], message, Hash::new_unique());
+        let tx = RuntimeTransaction::from_transaction_for_tests(tx);
+
+        // Bundles still value every tip the transaction carries...
+        assert_eq!(transaction_tip_lamports(&tx, &tip_accounts), 1_000_000_007);
+        // ...but priority only counts what the fee payer sends.
+        assert_eq!(payer_tip_lamports(&tx, &tip_accounts), 7);
     }
 
     #[test]
