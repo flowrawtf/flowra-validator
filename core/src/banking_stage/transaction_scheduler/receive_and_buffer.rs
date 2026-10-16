@@ -10,7 +10,10 @@ use {
             consumer::Consumer, decision_maker::BufferedPacketsDecision, packet_bytes,
             scheduler_messages::MaxAge,
         },
-        transaction_priority::calculate_priority_and_cost,
+        transaction_priority::{
+            calculate_priority_and_cost, calculate_priority_and_cost_with_tip_cap,
+            priority_tip_lamports,
+        },
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
     agave_transaction_view::{
@@ -33,7 +36,7 @@ use {
         transaction_meta::TransactionMeta, transaction_with_meta::TransactionWithMeta,
     },
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
-    solana_svm_transaction::svm_message::SVMMessage,
+    solana_svm_transaction::svm_message::{SVMMessage, SVMStaticMessage},
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransactionError,
     std::{collections::HashSet, time::Instant},
@@ -134,10 +137,46 @@ pub(crate) fn precheck_transaction(
     Consumer::check_fee_payer_unlocked(working_bank, state.transaction(), &mut error_counters)
         .map_err(|_| IngressCheckError::FeePayer)?;
 
+    let mut state = state;
+    cap_unfunded_tip(working_bank, &mut state);
+
     Ok(PrecheckedTransaction {
         state,
         validated_nonce_address,
     })
+}
+
+/// Tip-aware priority counts the tip a transaction says it pays. Nothing checks that the fee
+/// payer can fund it until execution, by which time an unfunded "tip" has already bought its
+/// place ahead of transactions that pay for real. Count at most what the fee payer holds
+/// beyond the fee.
+fn cap_unfunded_tip(bank: &Bank, state: &mut TransactionViewState) {
+    let transaction = state.transaction();
+    let tip = priority_tip_lamports(transaction);
+    if tip == 0 {
+        return;
+    }
+    let Ok(transaction_configuration) = transaction.transaction_configuration(&bank.feature_set)
+    else {
+        return;
+    };
+    let fee = solana_fee::calculate_fee(
+        transaction,
+        bank.fee_structure().lamports_per_signature,
+        transaction_configuration.priority_fee_lamports,
+        bank.fee_features(),
+    );
+    let spendable = bank.get_balance(transaction.fee_payer()).saturating_sub(fee);
+    if spendable >= tip {
+        return;
+    }
+    let (priority, _cost) = calculate_priority_and_cost_with_tip_cap(
+        bank,
+        transaction,
+        &transaction_configuration,
+        spendable,
+    );
+    state.set_priority(priority);
 }
 
 /// Perform sanitization checks and transition from data to an executable
