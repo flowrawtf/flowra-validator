@@ -28,7 +28,7 @@ use {
     arc_swap::ArcSwap,
     crossbeam_channel::{Receiver, RecvTimeoutError},
     smallvec::SmallVec,
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
     solana_measure::measure_us,
@@ -728,7 +728,7 @@ impl BundleStage {
         let mut bundle_stage_metrics = BundleStageLoopMetrics::default();
         let consume_worker_metrics = ConsumeWorkerMetrics::new(10_000);
 
-        let mut last_tip_update_slot = Slot::MAX;
+        let mut last_cranked_bank: Option<(Slot, BankId)> = None;
         while !exit.load(Ordering::Relaxed) {
             let block_engine_processing =
                 Self::block_engine_processing_enabled(&bam_enabled, &mut bundle_storage);
@@ -744,7 +744,7 @@ impl BundleStage {
                         &mut bundle_storage,
                         &bundle_account_locker,
                         &mut bundle_stage_metrics,
-                        &mut last_tip_update_slot,
+                        &mut last_cranked_bank,
                         &block_builder_fee_info,
                         &tip_managers,
                         &cluster_info,
@@ -876,7 +876,7 @@ impl BundleStage {
         bundle_storage: &mut BundleStorage,
         bundle_account_locker: &BundleAccountLocker,
         bundle_stage_metrics: &mut BundleStageLoopMetrics,
-        last_tip_update_slot: &mut Slot,
+        last_cranked_bank: &mut Option<(Slot, BankId)>,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         tip_managers: &TipManagers,
         cluster_info: &Arc<ClusterInfo>,
@@ -893,7 +893,7 @@ impl BundleStage {
                     bundle_account_locker,
                     consumer,
                     bundle_stage_metrics,
-                    last_tip_update_slot,
+                    last_cranked_bank,
                     block_builder_fee_info,
                     tip_managers,
                     cluster_info,
@@ -930,7 +930,7 @@ impl BundleStage {
         bundle_account_locker: &BundleAccountLocker,
         consumer: &mut BundleConsumer,
         bundle_stage_metrics: &mut BundleStageLoopMetrics,
-        last_tip_update_slot: &mut Slot,
+        last_cranked_bank: &mut Option<(Slot, BankId)>,
         block_builder_fee_info: &Arc<ArcSwap<BlockBuilderFeeInfo>>,
         tip_managers: &TipManagers,
         cluster_info: &Arc<ClusterInfo>,
@@ -940,7 +940,11 @@ impl BundleStage {
 
         let mut bundles = VecDeque::with_capacity(BUNDLE_WINDOW_SIZE.get());
 
-        if bank.slot() != *last_tip_update_slot {
+        // Keyed by bank, not slot: an Alpenglow sad handover replaces the leader bank for
+        // the same slot with one built on a different parent, and the crank committed to
+        // the cleared bank is gone with it.
+        let bank_key = (bank.slot(), bank.bank_id());
+        if *last_cranked_bank != Some(bank_key) {
             let outcome = Self::handle_tip_programs(
                 bank,
                 bundle_account_locker,
@@ -961,7 +965,7 @@ impl BundleStage {
             }
             // Anything else (missing programs on devnet/testnet, an upstream program we do
             // not control) will not succeed on retry and must not stop us building the block.
-            *last_tip_update_slot = bank.slot();
+            *last_cranked_bank = Some(bank_key);
         }
 
         // Clear out what this bank would reject anyway, so the window opens on live bundles.
@@ -1490,7 +1494,7 @@ mod tests {
             None,
         );
         let mut metrics = BundleStageLoopMetrics::default();
-        let mut last_tip_update_slot = Slot::MAX;
+        let mut last_cranked_bank: Option<(Slot, BankId)> = None;
         let identity = Arc::new(Keypair::new());
         let cluster_info = Arc::new(ClusterInfo::new(
             ContactInfo::new_localhost(&identity.pubkey(), timestamp()),
@@ -1508,7 +1512,7 @@ mod tests {
                 &mut storage,
                 &BundleAccountLocker::default(),
                 &mut metrics,
-                &mut last_tip_update_slot,
+                &mut last_cranked_bank,
                 &Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo::default())),
                 &TipManagers::new(vec![TipManagerConfig::default()]),
                 &cluster_info,
