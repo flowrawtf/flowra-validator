@@ -1,7 +1,6 @@
 use {
     crate::{
         banking_stage::{
-            consumer::Consumer,
             scheduler_messages::MaxAge,
             transaction_scheduler::{
                 receive_and_buffer::{PacketHandlingError, TransactionViewReceiveAndBuffer},
@@ -15,9 +14,9 @@ use {
     },
     ahash::HashSet,
     arrayvec::ArrayVec,
-    bytes::Bytes,
     smallvec::SmallVec,
     solana_clock::{BankId, Slot},
+    solana_perf::packet::bytes::Bytes,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_runtime_transaction::{
@@ -281,27 +280,33 @@ impl BundleStorage {
 
         // Returns true when the bundle should stay, after counting it if it goes.
         let mut keep = |bundle: &BundleTransactionId, stats: &mut PruneStats| -> bool {
+            // Only the two verdicts below prune, so only the two checks that produce them
+            // run: the blockhash's age (with the durable-nonce path) and the status cache.
+            // `check_transactions` would also derive each transaction's compute budget and
+            // fee, which execution recomputes anyway; over a full buffer that was most of
+            // the prune's time. The status cache lock is taken per bundle, not once for the
+            // sweep, so the workers committing to this bank are never held behind it.
             let verdict = {
-                let transactions: SmallVec<[&RuntimeTransactionView; 5]> = bundle
-                    .container_ids
-                    .iter()
-                    .map(|id| {
-                        container
-                            .get_transaction(*id)
-                            .expect("transaction must exist")
-                    })
-                    .collect();
-                let lock_results: SmallVec<[Result<(), TransactionError>; 5]> =
-                    SmallVec::from_elem(Ok(()), transactions.len());
-                Consumer::check_transactions_for_scheduling::<RuntimeTransactionView>(
-                    bank,
-                    &transactions,
-                    &lock_results,
-                    max_age,
-                    &mut error_counters,
-                )
-                .into_iter()
-                .find_map(|result| result.err())
+                let status_cache = bank.status_cache.read().unwrap();
+                bundle.container_ids.iter().find_map(|id| {
+                    let transaction = container
+                        .get_transaction(*id)
+                        .expect("transaction must exist");
+                    if let Err(err) = bank.check_transaction_without_status_cache(
+                        transaction,
+                        max_age,
+                        &mut error_counters,
+                    ) {
+                        return Some(err);
+                    }
+                    status_cache
+                        .get_status(
+                            transaction.message_hash(),
+                            transaction.recent_blockhash(),
+                            &bank.ancestors,
+                        )
+                        .map(|_| TransactionError::AlreadyProcessed)
+                })
             };
             match verdict {
                 Some(TransactionError::BlockhashNotFound) => stats.stale_blockhash += 1,
@@ -454,7 +459,6 @@ impl BundleStorage {
         }
 
         let mut container_ids = SmallVec::<[usize; 5]>::new();
-        let mut maybe_error = Ok(());
         let sanitize_config = sanitize_config();
         let transaction_account_lock_limit = working_bank
             .get_transaction_account_lock_limit()
@@ -462,37 +466,29 @@ impl BundleStorage {
 
         for (idx, packet) in batch.iter().enumerate() {
             // bundles shall contain all valid packets; checked above
-            let packet_data = packet.data(..).unwrap();
+            let bytes = Bytes::copy_from_slice(packet.data(..).unwrap());
 
             // try to insert the packet into the container
-            let insert_result = match TransactionViewReceiveAndBuffer::try_handle_packet(
-                Bytes::copy_from_slice(packet_data),
+            match TransactionViewReceiveAndBuffer::try_handle_packet(
+                bytes,
                 root_bank,
                 working_bank,
                 transaction_account_lock_limit,
                 &sanitize_config,
                 blacklisted_accounts,
             ) {
-                Ok(state) => self
-                    .transaction_view_state_container
-                    .try_insert_map_only(state),
+                Ok(state) => {
+                    container_ids
+                        .push(self.transaction_view_state_container.insert_map_only(state));
+                }
                 Err(e) => {
-                    maybe_error = Err(e);
-                    None
+                    // any error shall rollback any transactions added to the container
+                    for container_id in container_ids.iter() {
+                        self.transaction_view_state_container
+                            .remove_by_id(*container_id);
+                    }
+                    return Err(BundleStorageError::PacketFilterError((e, idx)));
                 }
-            };
-            if let Some(container_id) = insert_result {
-                container_ids.push(container_id);
-            } else {
-                // any error shall rollback any transactions added to the container
-                for container_id in container_ids.iter() {
-                    self.transaction_view_state_container
-                        .remove_by_id(*container_id);
-                }
-                return match maybe_error {
-                    Err(e) => Err(BundleStorageError::PacketFilterError((e, idx))),
-                    Ok(()) => Err(BundleStorageError::ContainerFull),
-                };
             }
         }
 
