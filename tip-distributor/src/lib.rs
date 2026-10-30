@@ -16,7 +16,7 @@ use {
             state::{ClaimStatus, TipDistributionAccount},
             tip_distribution_program_id,
             tip_payment::{
-                Config, CONFIG_ACCOUNT_SEED, TIP_ACCOUNT_SEED_0, TIP_ACCOUNT_SEED_1,
+                CONFIG_ACCOUNT_SEED, Config, TIP_ACCOUNT_SEED_0, TIP_ACCOUNT_SEED_1,
                 TIP_ACCOUNT_SEED_2, TIP_ACCOUNT_SEED_3, TIP_ACCOUNT_SEED_4, TIP_ACCOUNT_SEED_5,
                 TIP_ACCOUNT_SEED_6, TIP_ACCOUNT_SEED_7,
             },
@@ -24,7 +24,7 @@ use {
         stake_meta_generator_workflow::StakeMetaGeneratorError::CheckedMathError,
     },
     log::*,
-    serde::{de::DeserializeOwned, Deserialize, Serialize},
+    serde::{Deserialize, Serialize, de::DeserializeOwned},
     solana_account::{Account, AccountSharedData, ReadableAccount},
     solana_client::{
         nonblocking::rpc_client::RpcClient,
@@ -44,7 +44,7 @@ use {
     solana_rpc_client_api::{
         client_error::{Error, ErrorKind},
         config::RpcSendTransactionConfig,
-        request::{RpcError, RpcResponseErrorData, MAX_MULTIPLE_ACCOUNTS},
+        request::{MAX_MULTIPLE_ACCOUNTS, RpcError, RpcResponseErrorData},
         response::RpcSimulateTransactionResult,
     },
     solana_signature::Signature,
@@ -125,7 +125,10 @@ fn emit_inconsistent_tree_node_amount_dp(
             "tip-distributor",
             (
                 "actual_claims_exceeded",
-                format!("tip_distribution_account={tip_distribution_account},actual_claims={actual_claims}, expected_claims={expected_claims}"),
+                format!(
+                    "tip_distribution_account={tip_distribution_account},\
+                     actual_claims={actual_claims}, expected_claims={expected_claims}"
+                ),
                 String
             ),
         );
@@ -134,7 +137,10 @@ fn emit_inconsistent_tree_node_amount_dp(
             "tip-distributor",
             (
                 "actual_claims_below",
-                format!("tip_distribution_account={tip_distribution_account},actual_claims={actual_claims}, expected_claims={expected_claims}"),
+                format!(
+                    "tip_distribution_account={tip_distribution_account},\
+                     actual_claims={actual_claims}, expected_claims={expected_claims}"
+                ),
                 String
             ),
         );
@@ -690,10 +696,11 @@ async fn signed_send(
             // inner `TransactionError` field is private; convert via `Into` to inspect it.
             let preflight_inner_err = if let ErrorKind::RpcError(RpcError::RpcResponseError {
                 data:
-                    RpcResponseErrorData::SendTransactionPreflightFailure(RpcSimulateTransactionResult {
-                        err: Some(ui_err),
-                        ..
-                    }),
+                    RpcResponseErrorData::SendTransactionPreflightFailure(
+                        RpcSimulateTransactionResult {
+                            err: Some(ui_err), ..
+                        },
+                    ),
                 ..
             }) = &*e.kind
             {
@@ -715,7 +722,10 @@ async fn signed_send(
                     ..
                 }) if matches!(
                     preflight_inner_err,
-                    Some(TransactionError::InstructionError(0, InstructionError::Custom(0)))
+                    Some(TransactionError::InstructionError(
+                        0,
+                        InstructionError::Custom(0)
+                    ))
                 ) =>
                 {
                     Ok(())

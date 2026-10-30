@@ -1,14 +1,14 @@
 use {
     crate::{
+        GeneratedMerkleTree, GeneratedMerkleTreeCollection,
         jito_sdk::{
+            AccountDeserialize,
             sdk::instruction::{
-                upload_merkle_root_ix, UploadMerkleRootAccounts, UploadMerkleRootArgs,
+                UploadMerkleRootAccounts, UploadMerkleRootArgs, upload_merkle_root_ix,
             },
             state::{Config, TipDistributionAccount},
-            AccountDeserialize,
         },
-        read_json_from_file, sign_and_send_transactions_with_retries, GeneratedMerkleTree,
-        GeneratedMerkleTreeCollection,
+        read_json_from_file, sign_and_send_transactions_with_retries,
     },
     log::info,
     solana_client::nonblocking::rpc_client::RpcClient,
@@ -68,14 +68,33 @@ pub fn upload_merkle_root(
 
         info!("num trees to upload: {:?}", trees.len());
 
-        // heuristic to make sure we have enough funds to cover execution, assumes all trees need updating 
+        // heuristic to make sure we have enough funds to cover execution, assumes all trees need updating
         {
-            let initial_balance = rpc_client.get_balance(&keypair.pubkey()).await.expect("failed to get balance");
-            let desired_balance = (trees.len() as u64).checked_mul(DEFAULT_TARGET_LAMPORTS_PER_SIGNATURE).unwrap();
+            let initial_balance = rpc_client
+                .get_balance(&keypair.pubkey())
+                .await
+                .expect("failed to get balance");
+            let desired_balance = (trees.len() as u64)
+                .checked_mul(DEFAULT_TARGET_LAMPORTS_PER_SIGNATURE)
+                .unwrap();
             if initial_balance < desired_balance {
-                let sol_to_deposit = desired_balance.checked_sub(initial_balance).unwrap().checked_add(LAMPORTS_PER_SOL).unwrap().checked_sub(1).unwrap().checked_div(LAMPORTS_PER_SOL).unwrap(); // rounds up to nearest sol
-                panic!("Expected to have at least {} lamports in {}, current balance is {} lamports, deposit {} SOL to continue.",
-                       desired_balance, &keypair.pubkey(), initial_balance, sol_to_deposit)
+                let sol_to_deposit = desired_balance
+                    .checked_sub(initial_balance)
+                    .unwrap()
+                    .checked_add(LAMPORTS_PER_SOL)
+                    .unwrap()
+                    .checked_sub(1)
+                    .unwrap()
+                    .checked_div(LAMPORTS_PER_SOL)
+                    .unwrap(); // rounds up to nearest sol
+                panic!(
+                    "Expected to have at least {} lamports in {}, current balance is {} lamports, \
+                     deposit {} SOL to continue.",
+                    desired_balance,
+                    &keypair.pubkey(),
+                    initial_balance,
+                    sol_to_deposit
+                )
             }
         }
         let mut trees_needing_update: Vec<GeneratedMerkleTree> = vec![];
@@ -121,17 +140,25 @@ pub fn upload_merkle_root(
                         tip_distribution_account: tree.tip_distribution_account,
                     },
                 );
-                Transaction::new_with_payer(
-                    &[ix],
-                    Some(&keypair.pubkey()),
-                )
+                Transaction::new_with_payer(&[ix], Some(&keypair.pubkey()))
             })
             .collect();
 
         let (to_process, failed_transactions) = sign_and_send_transactions_with_retries(
-            &keypair, &rpc_client, max_concurrent_rpc_get_reqs, transactions, txn_send_batch_size, MAX_RETRY_DURATION).await;
+            &keypair,
+            &rpc_client,
+            max_concurrent_rpc_get_reqs,
+            transactions,
+            txn_send_batch_size,
+            MAX_RETRY_DURATION,
+        )
+        .await;
         if !to_process.is_empty() {
-            panic!("{} remaining mev claim transactions, {} failed requests.", to_process.len(), failed_transactions.len());
+            panic!(
+                "{} remaining mev claim transactions, {} failed requests.",
+                to_process.len(),
+                failed_transactions.len()
+            );
         }
     });
 

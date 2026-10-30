@@ -1,17 +1,18 @@
 use {
     crate::{
-        claim_mev_workflow::ClaimMevError, get_batched_accounts,
+        claim_mev_workflow::ClaimMevError,
+        get_batched_accounts,
         jito_sdk::{
+            AccountDeserialize,
             sdk::{
                 derive_config_account_address,
                 instruction::{
-                    close_claim_status_ix, close_tip_distribution_account_ix,
                     CloseClaimStatusAccounts, CloseClaimStatusArgs,
                     CloseTipDistributionAccountArgs, CloseTipDistributionAccounts,
+                    close_claim_status_ix, close_tip_distribution_account_ix,
                 },
             },
             state::{ClaimStatus, Config, TipDistributionAccount},
-            AccountDeserialize,
         },
         send_until_blockhash_expires,
     },

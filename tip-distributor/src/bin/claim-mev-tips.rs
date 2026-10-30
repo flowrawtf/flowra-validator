@@ -5,14 +5,14 @@ use {
     futures::future::join_all,
     gethostname::gethostname,
     log::*,
-    solana_keypair::{read_keypair_file, Keypair},
+    solana_keypair::{Keypair, read_keypair_file},
     solana_metrics::{datapoint_error, datapoint_info, set_host_id},
     solana_pubkey::Pubkey,
     solana_tip_distributor::{
-        claim_mev_workflow::{claim_mev_tips, ClaimMevError},
+        GeneratedMerkleTreeCollection,
+        claim_mev_workflow::{ClaimMevError, claim_mev_tips},
         read_json_from_file,
         reclaim_rent_workflow::reclaim_rent,
-        GeneratedMerkleTreeCollection,
     },
     std::{
         path::PathBuf,
