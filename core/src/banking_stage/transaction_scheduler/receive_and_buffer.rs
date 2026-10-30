@@ -134,11 +134,15 @@ pub(crate) fn precheck_transaction(
             err => IngressCheckError::Transaction(err),
         })?;
 
-    Consumer::check_fee_payer_unlocked(working_bank, state.transaction(), &mut error_counters)
-        .map_err(|_| IngressCheckError::FeePayer)?;
+    let spendable = Consumer::check_fee_payer_unlocked_with_remaining(
+        working_bank,
+        state.transaction(),
+        &mut error_counters,
+    )
+    .map_err(|_| IngressCheckError::FeePayer)?;
 
     let mut state = state;
-    cap_unfunded_tip(working_bank, &mut state);
+    cap_unfunded_tip(working_bank, &mut state, spendable);
 
     Ok(PrecheckedTransaction {
         state,
@@ -148,30 +152,20 @@ pub(crate) fn precheck_transaction(
 
 /// Tip-aware priority counts the tip a transaction says it pays. Nothing checks that the fee
 /// payer can fund it until execution, by which time an unfunded "tip" has already bought its
-/// place ahead of transactions that pay for real. Count at most what the fee payer holds
-/// beyond the fee.
-fn cap_unfunded_tip(bank: &Bank, state: &mut TransactionViewState) {
+/// place ahead of transactions that pay for real. Count at most `spendable`, what the fee
+/// payer holds beyond the fee. The fee-payer check just loaded that account and charged the
+/// fee to it; loading it again here, and re-deriving the budget and fee to do so, was a
+/// second accounts-db read for every tipped transaction received.
+fn cap_unfunded_tip(bank: &Bank, state: &mut TransactionViewState, spendable: u64) {
     let transaction = state.transaction();
     let tip = priority_tip_lamports(transaction);
-    if tip == 0 {
+    if tip == 0 || spendable >= tip {
         return;
     }
     let Ok(transaction_configuration) = transaction.transaction_configuration(&bank.feature_set)
     else {
         return;
     };
-    let fee = solana_fee::calculate_fee(
-        transaction,
-        bank.fee_structure().lamports_per_signature,
-        transaction_configuration.priority_fee_lamports,
-        bank.fee_features(),
-    );
-    let spendable = bank
-        .get_balance(transaction.fee_payer())
-        .saturating_sub(fee);
-    if spendable >= tip {
-        return;
-    }
     let (priority, _cost) = calculate_priority_and_cost_with_tip_cap(
         bank,
         transaction,
@@ -2156,5 +2150,101 @@ mod tests {
         assert!(container.is_queued(&nonce_entry));
 
         verify_container(&mut container, expected_len);
+    }
+    /// A transfer of `tip` lamports from `payer` to `tip_account`, as raw packet bytes.
+    fn tipped_transaction_bytes(
+        payer: &Keypair,
+        tip_account: &Pubkey,
+        tip: u64,
+        bank: &Bank,
+    ) -> Bytes {
+        let message = solana_message::Message::new(
+            &[
+                system_instruction::transfer(&payer.pubkey(), tip_account, tip),
+                ComputeBudgetInstruction::set_compute_unit_price(1),
+            ],
+            Some(&payer.pubkey()),
+        );
+        let transaction = Transaction::new(&[payer], message, bank.last_blockhash());
+        let packet = BytesPacket::from_data(&transaction).unwrap();
+        Bytes::copy_from_slice(packet.data(..).unwrap())
+    }
+
+    /// The one tip account the tests in this binary register: the registry is set once per
+    /// process, so every test that needs a tip account must use this one.
+    fn test_tip_account() -> Pubkey {
+        Pubkey::new_from_array([7u8; 32])
+    }
+
+    /// Turn tip-aware priority on for this process. The gate is read once, so if another
+    /// test read it first this returns false and the caller can only skip.
+    fn tip_aware_priority_enabled(probe: &Bytes) -> bool {
+        // SAFETY: tests in this binary that read the gate do so through the cached
+        // OnceLock; the variable is only ever set, never removed.
+        unsafe { std::env::set_var("FLOWRA_TIP_AWARE_PRIORITY", "1") };
+        crate::transaction_priority::set_tip_accounts([test_tip_account()]);
+        let view =
+            agave_transaction_view::transaction_view::SanitizedTransactionView::try_new_sanitized(
+                probe.clone(),
+                &sanitize_config(),
+            )
+            .unwrap();
+        crate::transaction_priority::priority_tip_lamports(&view) > 0
+    }
+
+    #[test]
+    fn test_precheck_counts_only_the_tip_the_fee_payer_can_fund() {
+        let tip_account = test_tip_account();
+        let (bank_forks, mint_keypair) = test_bank_forks_with_fee();
+        let bank = bank_forks.read().unwrap().root_bank();
+        let tip = 1_000_000;
+        let funded = tipped_transaction_bytes(&mint_keypair, &tip_account, tip, &bank);
+        if !tip_aware_priority_enabled(&funded) {
+            eprintln!("tip-aware priority already gated off in this process; skipping");
+            return;
+        }
+        // A payer that can cover the fee but only about a tenth of the tip it promises.
+        let poor = Keypair::new();
+        bank.transfer(
+            2 * bank.get_lamports_per_signature() + tip / 10,
+            &mint_keypair,
+            &poor.pubkey(),
+        )
+        .unwrap();
+        let unfunded = tipped_transaction_bytes(&poor, &tip_account, tip, &bank);
+
+        let precheck = |bytes: &Bytes| {
+            precheck_transaction(bytes.clone(), &bank, &bank, &HashSet::default())
+                .ok()
+                .unwrap()
+                .state
+        };
+        let funded_state = precheck(&funded);
+        let unfunded_state = precheck(&unfunded);
+        assert!(funded_state.priority() > unfunded_state.priority());
+        // The unfunded one counts exactly what is left after the fee.
+        let configuration = unfunded_state
+            .transaction()
+            .transaction_configuration(&bank.feature_set)
+            .unwrap();
+        let fee = solana_fee::calculate_fee(
+            unfunded_state.transaction(),
+            bank.fee_structure().lamports_per_signature,
+            configuration.priority_fee_lamports,
+            bank.fee_features(),
+        );
+        let spendable = bank.get_balance(&poor.pubkey()) - fee;
+        assert!(spendable < tip);
+        let (expected, _cost) = calculate_priority_and_cost_with_tip_cap(
+            &bank,
+            unfunded_state.transaction(),
+            &configuration,
+            spendable,
+        );
+        assert_eq!(unfunded_state.priority(), expected);
+        // The funded one counts the full tip.
+        let (expected, _cost) =
+            calculate_priority_and_cost(&bank, funded_state.transaction(), &configuration);
+        assert_eq!(funded_state.priority(), expected);
     }
 }
