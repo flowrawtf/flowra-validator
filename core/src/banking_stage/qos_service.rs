@@ -181,7 +181,7 @@ impl QosService {
                         } => {
                             // FLOWRA: the only place requested and consumed CU meet.
                             crate::observed_cu::record_transaction(
-                                tx_cost.transaction,
+                                transaction,
                                 tx_cost.programs_execution_cost(),
                                 *compute_units,
                             );

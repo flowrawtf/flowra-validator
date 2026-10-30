@@ -465,7 +465,7 @@ mod test {
     fn derived_per_thread_quota_does_not_shrink_with_more_workers() {
         let quota = |num_threads: usize, config: GreedySchedulerConfig| {
             let (mut scheduler, _work_receivers, _finished_work_sender) =
-                create_test_frame(num_threads, config, BundleAccountLocker::default());
+                create_test_frame(num_threads, config);
             scheduler.set_block_limit(100_000_000);
             scheduler.target_cu_per_thread(num_threads)
         };
@@ -504,9 +504,11 @@ mod test {
 
         let schedule = |config: GreedySchedulerConfig| {
             let (mut scheduler, work_receivers, _finished_work_sender) =
-                create_test_frame(8, config, BundleAccountLocker::default());
+                create_test_frame(8, config);
             scheduler.set_block_limit(100_000_000);
-            let summary = scheduler.schedule(&mut chain(), u64::MAX).unwrap();
+            let summary = scheduler
+                .schedule(&mut chain(), TEST_SLOT, u64::MAX)
+                .unwrap();
             let scheduled: usize = work_receivers
                 .iter()
                 .map(|receiver| collect_work(receiver).1.iter().map(Vec::len).sum::<usize>())
