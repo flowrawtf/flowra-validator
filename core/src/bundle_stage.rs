@@ -55,7 +55,26 @@ use {
 pub mod bundle_account_locker;
 mod bundle_consumer;
 mod bundle_storage;
+/// Upstream's lock-retry budget, sized for 400ms slots. Kept as the ceiling so a long test
+/// slot never waits longer than Jito ever did.
 const MAX_BUNDLE_RETRY_DURATION: Duration = Duration::from_millis(40);
+/// A bundle (or crank step) that cannot take its account locks retries for this fraction of
+/// the slot before it is given back to the buffer: 25ms at 400ms, 12.5ms at 200ms.
+///
+/// The bundle account locker already keeps BankingStage from taking new locks on the
+/// bundle's accounts, so what the retry waits out is a batch that was already executing:
+/// a few hundred microseconds, not tens of milliseconds. Waiting 40ms of a 200ms slot on one
+/// bundle starves the rest of the window, and every bundle behind it in the window is
+/// pre-locked the whole time, which keeps BankingStage off those accounts too.
+const BUNDLE_RETRY_SLOT_DIVISOR: u128 = 16;
+
+/// The lock-retry budget for one bundle on `bank`.
+fn bundle_retry_duration(bank: &Bank) -> Duration {
+    let budget = Duration::from_nanos(
+        u64::try_from(bank.ns_per_slot / BUNDLE_RETRY_SLOT_DIVISOR).unwrap_or(u64::MAX),
+    );
+    budget.min(MAX_BUNDLE_RETRY_DURATION)
+}
 const SLOT_BOUNDARY_CHECK_PERIOD: Duration = Duration::from_millis(10);
 
 // Stats emitted periodically
@@ -1124,7 +1143,7 @@ impl BundleStage {
                     bank,
                     &step.txs,
                     &max_ages,
-                    MAX_BUNDLE_RETRY_DURATION,
+                    bundle_retry_duration(bank),
                 );
                 let _ = bundle_account_locker.unlock_bundle(&step.txs, bank);
                 consume_worker_metrics.update_for_consume(&output);
@@ -1185,7 +1204,7 @@ impl BundleStage {
             bank,
             &initialize_tip_program_transactions,
             &max_ages,
-            MAX_BUNDLE_RETRY_DURATION,
+            bundle_retry_duration(bank),
         );
         let _ = bundle_account_locker.unlock_bundle(&initialize_tip_program_transactions, bank);
 
@@ -1260,7 +1279,7 @@ impl BundleStage {
             bank,
             &bundle.transactions,
             &bundle.max_ages,
-            MAX_BUNDLE_RETRY_DURATION,
+            bundle_retry_duration(bank),
         );
 
         consume_worker_metrics.update_for_consume(&output);
@@ -2373,5 +2392,27 @@ mod tests {
         bundle_stage.join().unwrap();
         poh_service.join().unwrap();
         drop(verified_bundle_sender);
+    }
+    #[test]
+    fn test_bundle_retry_duration_scales_with_the_slot() {
+        let bank_with_slot = |slot: Duration| {
+            let mut genesis_config = GenesisConfig::default();
+            genesis_config.ticks_per_slot = 64;
+            genesis_config.poh_config.target_tick_duration = slot / 64;
+            Bank::new_for_tests(&genesis_config)
+        };
+        assert_eq!(
+            bundle_retry_duration(&bank_with_slot(Duration::from_millis(200))),
+            Duration::from_micros(12_500)
+        );
+        assert_eq!(
+            bundle_retry_duration(&bank_with_slot(Duration::from_millis(400))),
+            Duration::from_millis(25)
+        );
+        // Never longer than upstream's fixed budget, however long the slot.
+        assert_eq!(
+            bundle_retry_duration(&bank_with_slot(Duration::from_millis(3_200))),
+            MAX_BUNDLE_RETRY_DURATION
+        );
     }
 }
