@@ -61,6 +61,19 @@ impl Default for GreedySchedulerConfig {
 /// block limit is raised by feature activation (e.g. SIMD-0286's 60M -> 100M).
 pub(crate) const BLOCK_LIMIT_IN_FLIGHT_DIVISOR: u64 = 4;
 
+/// With the derived budget, each worker may hold at least this fraction of the block limit
+/// in flight whatever the worker count: the per-thread quota four workers get.
+///
+/// The total is split evenly across workers, so adding workers shrinks every quota: at a
+/// 100M block limit, four workers get 6.25M CU each and eight get 3.125M. A quota is
+/// binding only for the serialized chain on a hot account, which can run on one thread
+/// only, since that thread holds the account's lock; every transaction behind it comes
+/// back as `UnschedulableThread` and is rescanned next pass, and the thread idles once it
+/// drains its queue before the pass refills it. Eight workers exist to run more of the
+/// block in parallel, not to queue less of it per thread. An explicit
+/// `--block-production-target-scheduled-cus` is left exactly as given.
+pub(crate) const BLOCK_LIMIT_PER_THREAD_FLOOR_DIVISOR: u64 = 16;
+
 /// Dead-simple scheduler that is efficient and will attempt to schedule
 /// in priority order, scheduling anything that can be immediately
 /// scheduled, up to the limits.
@@ -118,6 +131,15 @@ impl<Tx: TransactionWithMeta> GreedyScheduler<Tx> {
             .target_scheduled_cus
             .unwrap_or(self.block_limit / BLOCK_LIMIT_IN_FLIGHT_DIVISOR)
     }
+
+    /// In-flight CU one worker thread may hold; see [`BLOCK_LIMIT_PER_THREAD_FLOOR_DIVISOR`].
+    fn target_cu_per_thread(&self, num_threads: usize) -> u64 {
+        let share = self.target_scheduled_cus() / num_threads as u64;
+        match self.config.target_scheduled_cus {
+            Some(_) => share,
+            None => share.max(self.block_limit / BLOCK_LIMIT_PER_THREAD_FLOOR_DIVISOR),
+        }
+    }
 }
 
 impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
@@ -144,7 +166,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
         let starting_buffer_size = container.buffer_size();
 
         let num_threads = self.common.consume_work_senders.len();
-        let target_cu_per_thread = self.target_scheduled_cus() / num_threads as u64;
+        let target_cu_per_thread = self.target_cu_per_thread(num_threads);
 
         let mut schedulable_threads = ThreadSet::any(num_threads);
         for thread_id in 0..num_threads {
@@ -437,6 +459,75 @@ mod test {
 
         scheduler.set_block_limit(100_000_000);
         assert_eq!(scheduler.target_scheduled_cus(), 25_000_000);
+    }
+
+    #[test]
+    fn derived_per_thread_quota_does_not_shrink_with_more_workers() {
+        let quota = |num_threads: usize, config: GreedySchedulerConfig| {
+            let (mut scheduler, _work_receivers, _finished_work_sender) =
+                create_test_frame(num_threads, config, BundleAccountLocker::default());
+            scheduler.set_block_limit(100_000_000);
+            scheduler.target_cu_per_thread(num_threads)
+        };
+        // Four workers: a quarter of the limit split four ways, as upstream.
+        assert_eq!(quota(4, GreedySchedulerConfig::default()), 6_250_000);
+        // Eight and sixteen workers keep that per-thread quota instead of halving it.
+        assert_eq!(quota(8, GreedySchedulerConfig::default()), 6_250_000);
+        assert_eq!(quota(16, GreedySchedulerConfig::default()), 6_250_000);
+        // Fewer workers get the larger even share.
+        assert_eq!(quota(2, GreedySchedulerConfig::default()), 12_500_000);
+        // An explicit budget is split exactly as given, floor or no floor.
+        let explicit = || GreedySchedulerConfig {
+            target_scheduled_cus: Some(8_000_000),
+            ..GreedySchedulerConfig::default()
+        };
+        assert_eq!(quota(8, explicit()), 1_000_000);
+    }
+
+    #[test]
+    fn hot_account_chain_fits_the_per_thread_floor_with_eight_workers() {
+        // Every transaction writes the same account, so all of them must run on the one
+        // thread that holds its lock. With an even split of the budget eight ways (here
+        // 3M per thread), only part of the chain is scheduled per pass; the floor (6.25M)
+        // takes the whole chain.
+        const COST: u64 = 1_000_000;
+        let conflicting_pubkey = Pubkey::new_unique();
+        let chain = || {
+            let mut container = TransactionStateContainer::with_capacity(10 * 1024);
+            for priority in 1..=6u64 {
+                let transaction =
+                    prioritized_tranfers(&Keypair::new(), [conflicting_pubkey], 1, priority);
+                container.insert_new_transaction(transaction, MaxAge::MAX, priority, COST);
+            }
+            container
+        };
+
+        let schedule = |config: GreedySchedulerConfig| {
+            let (mut scheduler, work_receivers, _finished_work_sender) =
+                create_test_frame(8, config, BundleAccountLocker::default());
+            scheduler.set_block_limit(100_000_000);
+            let summary = scheduler.schedule(&mut chain(), u64::MAX).unwrap();
+            let scheduled: usize = work_receivers
+                .iter()
+                .map(|receiver| collect_work(receiver).1.iter().map(Vec::len).sum::<usize>())
+                .sum();
+            (
+                summary.num_scheduled,
+                summary.num_unschedulable_threads,
+                scheduled,
+            )
+        };
+
+        // The old even split, asked for explicitly: 3 of 6 fit, 3 come back unschedulable.
+        assert_eq!(
+            schedule(GreedySchedulerConfig {
+                target_scheduled_cus: Some(24_000_000),
+                ..GreedySchedulerConfig::default()
+            }),
+            (3, 3, 3)
+        );
+        // The derived budget with the floor: the whole chain in one pass.
+        assert_eq!(schedule(GreedySchedulerConfig::default()), (6, 0, 6));
     }
 
     #[test]
