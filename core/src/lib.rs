@@ -31,6 +31,7 @@ pub mod forwarding_stage;
 pub mod gen_keys;
 pub mod multicast_shred_check_service;
 pub mod next_leader;
+pub mod observed_cu;
 pub mod optimistic_confirmation_verifier;
 pub mod packet_bundle;
 pub mod proxy;

@@ -179,6 +179,12 @@ impl QosService {
                             result: _,
                             fee_payer_post_balance: _,
                         } => {
+                            // FLOWRA: the only place requested and consumed CU meet.
+                            crate::observed_cu::record_transaction(
+                                tx_cost.transaction,
+                                tx_cost.programs_execution_cost(),
+                                *compute_units,
+                            );
                             let estimated_load_and_execution_units = tx_cost
                                 .programs_execution_cost()
                                 .saturating_add(tx_cost.loaded_accounts_data_size_cost());
