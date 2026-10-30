@@ -27,6 +27,11 @@ pub(crate) struct AuthRefreshState {
 }
 
 impl AuthRefreshState {
+    /// The access token as minted; for handing on to another party.
+    pub(crate) fn access_token(&self) -> Arc<Token> {
+        self.access_token.load_full()
+    }
+
     pub(crate) fn interceptor(&self) -> AuthInterceptor {
         AuthInterceptor {
             access_token: self.access_token.clone(),

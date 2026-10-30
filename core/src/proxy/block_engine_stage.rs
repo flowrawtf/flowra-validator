@@ -1101,16 +1101,14 @@ impl BlockEngineStage {
             }
         };
 
-        let (_auth_client, access_token, _refresh) =
-            match auth_client_from_endpoint(&endpoint, connection_timeout, keypair).await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("upstream {upstream_url}: authentication failed: {e:?}");
-                    return retry();
-                }
-            };
+        let token = match auth_client_from_endpoint(&endpoint, connection_timeout, keypair).await {
+            Ok(auth) => auth.access_token(),
+            Err(e) => {
+                warn!("upstream {upstream_url}: authentication failed: {e:?}");
+                return retry();
+            }
+        };
 
-        let token = access_token.load();
         let expires_at = token.expires_at_utc;
         let request = block_engine::UpstreamToken {
             upstream_url: upstream_url.clone(),

@@ -1,6 +1,7 @@
 use {
     crate::{
         banking_stage::{
+            consumer::Consumer,
             scheduler_messages::MaxAge,
             transaction_scheduler::{
                 receive_and_buffer::{PacketHandlingError, TransactionViewReceiveAndBuffer},
@@ -292,11 +293,11 @@ impl BundleStorage {
                     .collect();
                 let lock_results: SmallVec<[Result<(), TransactionError>; 5]> =
                     SmallVec::from_elem(Ok(()), transactions.len());
-                bank.check_transactions::<RuntimeTransactionView>(
+                Consumer::check_transactions_for_scheduling::<RuntimeTransactionView>(
+                    bank,
                     &transactions,
                     &lock_results,
                     max_age,
-                    true,
                     &mut error_counters,
                 )
                 .into_iter()

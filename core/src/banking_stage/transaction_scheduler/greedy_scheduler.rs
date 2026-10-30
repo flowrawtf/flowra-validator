@@ -429,11 +429,8 @@ mod test {
     fn default_in_flight_budget_follows_the_block_limit() {
         // SIMD-0286 raised the block limit from 60M to 100M by feature activation. A budget
         // pinned to the compile-time constant would stay sized for the old limit forever.
-        let (mut scheduler, _work_receivers, _finished_work_sender) = create_test_frame(
-            1,
-            GreedySchedulerConfig::default(),
-            BundleAccountLocker::default(),
-        );
+        let (mut scheduler, _work_receivers, _finished_work_sender) =
+            create_test_frame(1, GreedySchedulerConfig::default());
 
         // Before any leader bank is seen, fall back to the compile-time limit.
         assert_eq!(scheduler.target_scheduled_cus(), MAX_BLOCK_UNITS / 4);
@@ -452,7 +449,6 @@ mod test {
                 target_scheduled_cus: Some(50_000_000),
                 ..GreedySchedulerConfig::default()
             },
-            BundleAccountLocker::default(),
         );
 
         scheduler.set_block_limit(100_000_000);

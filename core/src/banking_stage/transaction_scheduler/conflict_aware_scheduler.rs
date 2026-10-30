@@ -136,8 +136,8 @@ impl ConflictAwarePassStats {
             info!(
                 "conflict_aware_scheduler_stats: slot={prev_slot} passes={} popped={} \
                  scheduled={} unschedulable_conflict={} unschedulable_thread={} \
-                 total_cu={total_cu} max_cu={max_cu} min_cu={min_cu} \
-                 imbalance={imbalance:.3} per_thread_cu={cus:?}",
+                 total_cu={total_cu} max_cu={max_cu} min_cu={min_cu} imbalance={imbalance:.3} \
+                 per_thread_cu={cus:?}",
                 self.passes,
                 self.popped,
                 self.scheduled,
@@ -317,8 +317,8 @@ impl<Tx: TransactionWithMeta> ConflictAwareScheduler<Tx> {
             .unwrap_or(64);
         if stage0_enabled {
             info!(
-                "conflict_aware_stage0: ENABLED top_k={stage0_top_k} \
-                 (hot-account CU-balanced thread affinity)"
+                "conflict_aware_stage0: ENABLED top_k={stage0_top_k} (hot-account CU-balanced \
+                 thread affinity)"
             );
         }
         let cooc_probe_enabled = env::var("FLOWRA_COOC_PROBE")
@@ -415,6 +415,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
     fn schedule<S: StateContainer<Tx>>(
         &mut self,
         container: &mut S,
+        slot: Slot,
         budget: u64,
     ) -> Result<SchedulingSummary, SchedulerError> {
         // Subtract any in-flight compute units from the budget.
@@ -553,7 +554,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
                     if self.common.batches.entry_bytes()[thread_id] + transaction_bytes
                         > self.config.target_entry_bytes_per_batch
                     {
-                        num_sent += self.common.send_batches()?;
+                        num_sent += self.common.send_batches(slot)?;
                     }
 
                     num_scheduled += 1;
@@ -583,7 +584,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
                     if self.common.batches.transactions()[thread_id].len()
                         >= self.config.target_transactions_per_batch
                     {
-                        num_sent += self.common.send_batches()?;
+                        num_sent += self.common.send_batches(slot)?;
                     }
 
                     // if the thread is at target_cu_per_thread, remove it from the schedulable threads
@@ -601,7 +602,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
             }
         }
 
-        num_sent += self.common.send_batches()?;
+        num_sent += self.common.send_batches(slot)?;
         let Saturating(num_scheduled) = num_scheduled;
         assert_eq!(
             num_scheduled, num_sent,
@@ -628,6 +629,10 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for ConflictAwareScheduler<Tx> {
             num_unschedulable_conflicts,
             num_unschedulable_threads,
         })
+    }
+
+    fn has_in_flight_transactions(&self) -> bool {
+        self.common.in_flight_tracker.has_in_flight_transactions()
     }
 
     // FLOWRA PoC: same as the trait's default implementation, plus leader-slot
