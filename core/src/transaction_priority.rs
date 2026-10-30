@@ -251,13 +251,22 @@ pub(crate) fn calculate_priority_and_cost_with_tip_cap<Tx: TransactionMeta + SVM
     transaction_configuration: &TransactionConfiguration,
     tip_cap: u64,
 ) -> (u64, u64) {
-    let cost = CostModel::calculate_cost_for_executed_transaction(
+    let cost_details = CostModel::calculate_cost_for_executed_transaction(
         transaction,
         u64::from(transaction_configuration.compute_unit_limit),
         transaction_configuration.loaded_accounts_data_size_limit,
         &bank.feature_set,
-    )
-    .sum();
+    );
+    // FLOWRA: with `FLOWRA_OBSERVED_CU=1`, charge the execution part at what the program
+    // has been seen to consume rather than at its requested limit. Off, this is the sum.
+    let requested_execution_cost = cost_details.programs_execution_cost();
+    let cost = cost_details
+        .sum()
+        .saturating_sub(requested_execution_cost)
+        .saturating_add(crate::observed_cu::scheduling_execution_cost(
+            transaction,
+            requested_execution_cost,
+        ));
     let fee_details = solana_fee::calculate_fee_details(
         transaction,
         bank.fee_structure().lamports_per_signature,
