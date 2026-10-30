@@ -6,17 +6,18 @@ use {
         banking_stage::{committer::CommitTransactionDetails, consumer::Consumer},
         bundle_stage::bundle_account_locker::BundleAccountLocker,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
-        tip_manager::TipManagers,
+        tip_manager::{CrankChainResult, CrankStep, TipManagers},
     },
     arc_swap::ArcSwap,
     jito_protos::proto::{
         bam_api::{SchedulerMessage, SchedulerMessageV0, scheduler_message::VersionedMsg},
         bam_types,
     },
-    smallvec::SmallVec,
     solana_gossip::cluster_info::ClusterInfo,
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+    solana_transaction::sanitized::SanitizedTransaction,
     solana_turbine::ShredReceiverAddresses,
     std::sync::RwLock,
     tokio::sync::mpsc,
@@ -92,11 +93,7 @@ impl TipProcessingDependencies {
             return false;
         }
         let keypair = self.cluster_info.keypair();
-        let process = |bundle: crate::tip_manager::Result<SmallVec<[_; 2]>>| {
-            let Ok(bundle) = bundle else {
-                debug!("tip bundle construction failed for bank {bank_key:?}: {bundle:?}");
-                return false;
-            };
+        let process = |bundle: &[RuntimeTransaction<SanitizedTransaction>]| {
             if bundle.is_empty() {
                 return true;
             }
@@ -126,29 +123,30 @@ impl TipProcessingDependencies {
         for (i, tip_manager) in self.tip_managers.iter().enumerate() {
             let program = tip_manager.tip_payment_program_id();
             // Crank construction reads the accounts created by initialization; keep it lazy.
-            let ok = process(tip_manager.get_initialize_tip_programs_bundle(bank, &keypair))
-                && match tip_manager.get_crank_steps(bank, &keypair, builder) {
-                    Ok(steps) => {
-                        let mut steps_ok = true;
-                        for step in steps {
-                            if !process(Ok(step.txs)) {
-                                warn!(
-                                    "tip program {program} crank step {} did not commit",
-                                    step.label
-                                );
-                                steps_ok = false;
-                                if step.blocking {
-                                    break;
-                                }
-                            }
-                        }
-                        steps_ok
-                    }
-                    Err(e) => {
-                        error!("tip program {program} crank could not be built: {e:?}");
-                        false
-                    }
-                };
+            let ok = match tip_manager.get_initialize_tip_programs_bundle(bank, &keypair) {
+                Ok(init) => process(&init),
+                Err(e) => {
+                    debug!("tip bundle construction failed for bank {bank_key:?}: {e:?}");
+                    false
+                }
+            } && match tip_manager.get_crank_steps(bank, &keypair, builder) {
+                Ok(steps) => {
+                    CrankStep::run_chain(
+                        steps,
+                        &mut |step| process(&step.txs).then_some(()).ok_or(()),
+                        &mut |step, ()| {
+                            warn!(
+                                "tip program {program} crank step {} did not commit",
+                                step.label
+                            );
+                        },
+                    ) == CrankChainResult::Committed
+                }
+                Err(e) => {
+                    error!("tip program {program} crank could not be built: {e:?}");
+                    false
+                }
+            };
             if !ok && i == 0 {
                 primary_ok = false;
             }

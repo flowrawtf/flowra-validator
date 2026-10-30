@@ -428,36 +428,64 @@ impl TipManager {
                 txs: smallvec::smallvec![
                     self.initialize_tip_distribution_account_tx(bank, keypair)?
                 ],
+                fallback: vec![],
             });
         }
 
         let cfg = self.get_tip_payment_config_account(bank)?;
         let my_tip_receiver = self.get_my_tip_distribution_pda(bank.epoch());
 
-        if cfg.tip_receiver() != my_tip_receiver {
-            steps.push(CrankStep {
-                label: "change_tip_receiver",
-                // change_block_builder re-checks the tip receiver against the config.
-                blocking: true,
-                txs: smallvec::smallvec![self.change_tip_receiver_tx(
-                    &cfg.tip_receiver(),
-                    &my_tip_receiver,
-                    &cfg.block_builder(),
-                    bank,
-                    keypair,
-                )?],
-            });
-        }
+        let change_tip_receiver = (cfg.tip_receiver() != my_tip_receiver)
+            .then(|| -> Result<CrankStep> {
+                Ok(CrankStep {
+                    label: "change_tip_receiver",
+                    // change_block_builder re-checks the tip receiver against the config.
+                    blocking: true,
+                    txs: smallvec::smallvec![self.change_tip_receiver_tx(
+                        &cfg.tip_receiver(),
+                        &my_tip_receiver,
+                        &cfg.block_builder(),
+                        bank,
+                        keypair,
+                    )?],
+                    fallback: vec![],
+                })
+            })
+            .transpose()?;
 
-        if cfg.block_builder() != block_builder_fee_info.block_builder
-            || cfg.block_builder_commission_pct() != block_builder_fee_info.block_builder_commission
-        {
-            steps.push(CrankStep {
-                label: "change_block_builder",
-                // Purely a fee-routing preference; nothing downstream depends on it, so a
-                // misconfigured block builder must not cost us the TDA or the receiver.
-                blocking: false,
-                txs: smallvec::smallvec![self.change_block_builder_tx(
+        let change_block_builder = (cfg.block_builder() != block_builder_fee_info.block_builder
+            || cfg.block_builder_commission_pct()
+                != block_builder_fee_info.block_builder_commission)
+            .then(|| -> Result<CrankStep> {
+                Ok(CrankStep {
+                    label: "change_block_builder",
+                    // Purely a fee-routing preference; nothing downstream depends on it, so a
+                    // misconfigured block builder must not cost us the TDA or the receiver.
+                    blocking: false,
+                    txs: smallvec::smallvec![self.change_block_builder_tx(
+                        &my_tip_receiver,
+                        &cfg.block_builder(),
+                        &block_builder_fee_info.block_builder,
+                        block_builder_fee_info.block_builder_commission,
+                        bank,
+                        keypair,
+                    )?],
+                    fallback: vec![],
+                })
+            })
+            .transpose()?;
+
+        match (change_tip_receiver, change_block_builder) {
+            // The opening slot of every window needs both. Jito sends them as one
+            // transaction, and so do we: one execution and one PoH record round trip
+            // instead of two, serialized at the head of the slot before any bundle can run.
+            // The separate steps stay as the fallback, so a block builder the program
+            // rejects still costs us only that step, never the receiver.
+            (Some(receiver), Some(builder)) => steps.push(CrankStep {
+                label: "change_tip_receiver_and_block_builder",
+                blocking: true,
+                txs: smallvec::smallvec![self.change_tip_receiver_and_block_builder_tx(
+                    &cfg.tip_receiver(),
                     &my_tip_receiver,
                     &cfg.block_builder(),
                     &block_builder_fee_info.block_builder,
@@ -465,7 +493,9 @@ impl TipManager {
                     bank,
                     keypair,
                 )?],
-            });
+                fallback: vec![receiver, builder],
+            }),
+            (receiver, builder) => steps.extend(receiver.into_iter().chain(builder)),
         }
 
         Ok(steps)
@@ -504,15 +534,59 @@ impl TipManager {
         bank: &Bank,
         keypair: &Keypair,
     ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
-        let ix = Instruction {
+        let ix = self.change_tip_receiver_ix(
+            old_tip_receiver,
+            new_tip_receiver,
+            old_block_builder,
+            keypair,
+        );
+        Ok(self.sign_tx(&[ix], bank, keypair))
+    }
+
+    fn change_tip_receiver_ix(
+        &self,
+        old_tip_receiver: &Pubkey,
+        new_tip_receiver: &Pubkey,
+        old_block_builder: &Pubkey,
+        keypair: &Keypair,
+    ) -> Instruction {
+        Instruction {
             program_id: self.tip_payment_program_info.program_id,
             data: ChangeTipReceiverInstruction::to_instruction_data(),
             accounts: self.tip_ix_accounts(
                 &[*old_tip_receiver, *new_tip_receiver, *old_block_builder],
                 keypair,
             ),
-        };
-        Ok(self.sign_tx(&[ix], bank, keypair))
+        }
+    }
+
+    /// Both metadata changes in one transaction, the way upstream Jito cranks: the receiver
+    /// first, then the block builder against the receiver just set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn change_tip_receiver_and_block_builder_tx(
+        &self,
+        old_tip_receiver: &Pubkey,
+        new_tip_receiver: &Pubkey,
+        old_block_builder: &Pubkey,
+        new_block_builder: &Pubkey,
+        block_builder_commission: u64,
+        bank: &Bank,
+        keypair: &Keypair,
+    ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
+        let change_tip_receiver = self.change_tip_receiver_ix(
+            old_tip_receiver,
+            new_tip_receiver,
+            old_block_builder,
+            keypair,
+        );
+        let change_block_builder = self.change_block_builder_ix(
+            new_tip_receiver,
+            old_block_builder,
+            new_block_builder,
+            block_builder_commission,
+            keypair,
+        )?;
+        Ok(self.sign_tx(&[change_tip_receiver, change_block_builder], bank, keypair))
     }
 
     /// Set the block builder and its commission. Must run after [`Self::change_tip_receiver_tx`]
@@ -526,7 +600,25 @@ impl TipManager {
         bank: &Bank,
         keypair: &Keypair,
     ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
-        let ix = Instruction {
+        let ix = self.change_block_builder_ix(
+            tip_receiver,
+            old_block_builder,
+            new_block_builder,
+            block_builder_commission,
+            keypair,
+        )?;
+        Ok(self.sign_tx(&[ix], bank, keypair))
+    }
+
+    fn change_block_builder_ix(
+        &self,
+        tip_receiver: &Pubkey,
+        old_block_builder: &Pubkey,
+        new_block_builder: &Pubkey,
+        block_builder_commission: u64,
+        keypair: &Keypair,
+    ) -> Result<Instruction> {
+        Ok(Instruction {
             program_id: self.tip_payment_program_info.program_id,
             data: ChangeBlockBuilderInstruction::to_instruction_data(block_builder_commission)?,
             accounts: {
@@ -542,8 +634,7 @@ impl TipManager {
                 ));
                 accounts
             },
-        };
-        Ok(self.sign_tx(&[ix], bank, keypair))
+        })
     }
 
     /// Account list shared by the tip-payment mutating instructions:
@@ -577,6 +668,52 @@ pub struct CrankStep {
     pub txs: SmallVec<[RuntimeTransaction<SanitizedTransaction>; 2]>,
     /// Whether a failure here invalidates the remaining steps of the same program.
     pub blocking: bool,
+    /// Steps that do this step's work in its place when it fails: the same chain, split
+    /// into more transactions. Empty for a step that has no other form.
+    pub fallback: Vec<CrankStep>,
+}
+
+/// How a program's crank chain ended; see [`CrankStep::run_chain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrankChainResult {
+    /// Every step committed, directly or through its fallback.
+    Committed,
+    /// A non-blocking step failed; the chain ran to its end regardless.
+    Degraded,
+    /// A blocking step failed (and its fallback, if it had one); the rest never ran.
+    Broken,
+}
+
+impl CrankStep {
+    /// Drive one program's chain. `run` executes a step and reports whether it committed;
+    /// `on_failure` is told of each step that failed for good, i.e. one without a fallback,
+    /// since a step whose fallback commits has not failed at all.
+    pub fn run_chain<E>(
+        steps: Vec<CrankStep>,
+        run: &mut impl FnMut(&CrankStep) -> std::result::Result<(), E>,
+        on_failure: &mut impl FnMut(&CrankStep, &E),
+    ) -> CrankChainResult {
+        let mut result = CrankChainResult::Committed;
+        for step in steps {
+            let Err(error) = run(&step) else {
+                continue;
+            };
+            if !step.fallback.is_empty() {
+                match Self::run_chain(step.fallback, run, on_failure) {
+                    CrankChainResult::Committed => {}
+                    CrankChainResult::Degraded => result = CrankChainResult::Degraded,
+                    CrankChainResult::Broken => return CrankChainResult::Broken,
+                }
+                continue;
+            }
+            on_failure(&step, &error);
+            if step.blocking {
+                return CrankChainResult::Broken;
+            }
+            result = CrankChainResult::Degraded;
+        }
+        result
+    }
 }
 
 /// The tip programs this validator cranks each leader slot.
@@ -621,5 +758,94 @@ impl TipManagers {
     /// program id is required (e.g. the fetch-stage account filter).
     pub fn primary(&self) -> &TipManager {
         &self.managers[0]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(label: &'static str, blocking: bool, fallback: Vec<CrankStep>) -> CrankStep {
+        CrankStep {
+            label,
+            txs: SmallVec::new(),
+            blocking,
+            fallback,
+        }
+    }
+
+    /// Run `steps` where every label in `failing` fails; returns the chain result, the labels
+    /// run in order, and the labels reported as failed for good.
+    fn drive(
+        steps: Vec<CrankStep>,
+        failing: &[&str],
+    ) -> (CrankChainResult, Vec<&'static str>, Vec<&'static str>) {
+        let mut ran = vec![];
+        let mut failed = vec![];
+        let result = CrankStep::run_chain(
+            steps,
+            &mut |step| {
+                ran.push(step.label);
+                if failing.contains(&step.label) {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |step, ()| failed.push(step.label),
+        );
+        (result, ran, failed)
+    }
+
+    fn merged_chain() -> Vec<CrankStep> {
+        vec![
+            step("init_tda", true, vec![]),
+            step(
+                "merged",
+                true,
+                vec![
+                    step("receiver", true, vec![]),
+                    step("builder", false, vec![]),
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_run_chain_merged_step_commits_in_one_go() {
+        let (result, ran, failed) = drive(merged_chain(), &[]);
+        assert_eq!(result, CrankChainResult::Committed);
+        assert_eq!(ran, ["init_tda", "merged"]);
+        assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn test_run_chain_falls_back_to_split_steps() {
+        // The merged transaction is rejected; the split steps do its work and nothing is
+        // reported as failed.
+        let (result, ran, failed) = drive(merged_chain(), &["merged"]);
+        assert_eq!(result, CrankChainResult::Committed);
+        assert_eq!(ran, ["init_tda", "merged", "receiver", "builder"]);
+        assert!(failed.is_empty());
+
+        // A block builder the program rejects costs only that step, as before the merge.
+        let (result, ran, failed) = drive(merged_chain(), &["merged", "builder"]);
+        assert_eq!(result, CrankChainResult::Degraded);
+        assert_eq!(ran, ["init_tda", "merged", "receiver", "builder"]);
+        assert_eq!(failed, ["builder"]);
+
+        // The receiver failing in the fallback breaks the chain, as it always did.
+        let (result, ran, failed) = drive(merged_chain(), &["merged", "receiver"]);
+        assert_eq!(result, CrankChainResult::Broken);
+        assert_eq!(ran, ["init_tda", "merged", "receiver"]);
+        assert_eq!(failed, ["receiver"]);
+    }
+
+    #[test]
+    fn test_run_chain_blocking_failure_stops_the_chain() {
+        let (result, ran, failed) = drive(merged_chain(), &["init_tda"]);
+        assert_eq!(result, CrankChainResult::Broken);
+        assert_eq!(ran, ["init_tda"]);
+        assert_eq!(failed, ["init_tda"]);
     }
 }
