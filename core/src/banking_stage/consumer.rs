@@ -7,6 +7,7 @@ use {
     },
     crate::bundle_stage::bundle_account_locker::BundleAccountLocker,
     smallvec::SmallVec,
+    solana_account::ReadableAccount,
     solana_accounts_db::accounts::TransactionAccountLocksIterator,
     solana_measure::measure_us,
     solana_poh::{
@@ -676,6 +677,17 @@ impl Consumer {
         transaction: &impl StaticMessageWithMeta,
         error_counters: &mut TransactionErrorMetrics,
     ) -> Result<(), TransactionError> {
+        Self::check_fee_payer_unlocked_with_remaining(bank, transaction, error_counters)
+            .map(|_remaining| ())
+    }
+
+    /// [`Self::check_fee_payer_unlocked`], also returning the lamports the fee payer keeps
+    /// once the fee is taken: what it has left to fund the transaction itself.
+    pub fn check_fee_payer_unlocked_with_remaining(
+        bank: &Bank,
+        transaction: &impl TransactionWithMeta,
+        error_counters: &mut TransactionErrorMetrics,
+    ) -> Result<u64, TransactionError> {
         let fee_payer = transaction.fee_payer();
         let transaction_configuration = transaction.transaction_configuration(&bank.feature_set)?;
         let fee = solana_fee::calculate_fee(
@@ -697,7 +709,9 @@ impl Consumer {
             bank.feature_set
                 .snapshot()
                 .relax_post_exec_min_balance_check,
-        )
+        )?;
+        // `validate_fee_payer` has charged the fee to this copy of the account.
+        Ok(fee_payer_account.lamports())
     }
 }
 
