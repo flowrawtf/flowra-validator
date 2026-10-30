@@ -273,12 +273,18 @@ impl BundleConsumer {
     where
         Tx: TransactionWithMeta,
     {
+        // What the retry waits for is a BankingStage batch that was already executing when
+        // the bundle was pre-locked, which finishes in well under a millisecond. A 1ms sleep
+        // (1.05-1.1ms on Linux) made that the floor of every contended lock; 50us keeps the
+        // thread off the CPU without adding a millisecond to each bundle.
+        const ACCOUNT_IN_USE_RETRY_SLEEP: Duration = Duration::from_micros(50);
+
         let start = Instant::now();
         while start.elapsed() < max_bundle_duration {
             let batch = bank.prepare_sanitized_batch(txs);
             if let Some(err) = batch.lock_results().iter().find(|x| x.is_err()) {
                 if err.as_ref().unwrap_err() == &TransactionError::AccountInUse {
-                    sleep(Duration::from_millis(1));
+                    sleep(ACCOUNT_IN_USE_RETRY_SLEEP);
                 } else {
                     return batch;
                 }
@@ -1307,5 +1313,44 @@ mod tests {
                 InstructionError::Custom(1)
             ))
         );
+    }
+
+    #[test]
+    fn test_try_lock_reacquires_promptly_after_release() {
+        use std::time::Instant;
+        let bank = Bank::new_for_tests(&create_genesis_config(100).0);
+        let kp1 = Keypair::new();
+        let tx = transfer(&kp1, &new_rand(), 1, bank.last_blockhash());
+        let tx = vec![RuntimeTransaction::from_transaction_for_tests(tx)];
+        let tx2 = transfer(&kp1, &new_rand(), 1, bank.last_blockhash());
+        let tx2 = vec![RuntimeTransaction::from_transaction_for_tests(tx2)];
+
+        // A BankingStage batch holds the fee payer for 300us, then releases it. The bundle
+        // should get the lock shortly after that, not a full sleep quantum later.
+        let mut samples = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let batch_1 = bank.prepare_sanitized_batch(&tx);
+            let release_at = Instant::now() + Duration::from_micros(300);
+            let (acquired, released) = std::thread::scope(|scope| {
+                let holder = scope.spawn(move || {
+                    while Instant::now() < release_at {
+                        std::hint::spin_loop();
+                    }
+                    drop(batch_1);
+                    Instant::now()
+                });
+                let batch_2 = BundleConsumer::try_lock_batch(&bank, &tx2, Duration::from_secs(1));
+                let acquired = Instant::now();
+                assert!(batch_2.lock_results().iter().all(|x| x.is_ok()));
+                (acquired, holder.join().unwrap())
+            });
+            samples.push(acquired.saturating_duration_since(released));
+        }
+        samples.sort();
+        let (min, median, max) = (samples[0], samples[10], samples[19]);
+        eprintln!("lock wait after release: min={min:?} median={median:?} max={max:?}");
+        // With the 1ms retry sleep the median was 780us (min 90us, max 1.3ms); with 50us it
+        // is 60us (min 12us, max 480us).
+        assert!(median < Duration::from_micros(300), "median {median:?}");
     }
 }
