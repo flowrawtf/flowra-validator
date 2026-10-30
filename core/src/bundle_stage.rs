@@ -75,7 +75,19 @@ fn bundle_retry_duration(bank: &Bank) -> Duration {
     );
     budget.min(MAX_BUNDLE_RETRY_DURATION)
 }
+/// How long the loop waits for a bundle while the next leader window is far away.
 const SLOT_BOUNDARY_CHECK_PERIOD: Duration = Duration::from_millis(10);
+/// Poll while holding bundles for an imminent window, and while leader with nothing buffered.
+///
+/// Upstream waited not at all while bundles were buffered, whatever the leader state: with the
+/// window still ahead that is a thread spinning at 100% of a core for the whole pre-leader
+/// hold (20 slots, 4s at 200ms), re-reading a decision that cannot change for milliseconds.
+/// Leader with nothing buffered, it waited the full 10ms above before it noticed a new bank,
+/// 5% of a 200ms slot in which tips paid in our own block still went to the previous
+/// leader's receiver and any bundle that arrived waited on the crank.
+const LEADER_POLL_PERIOD: Duration = Duration::from_micros(500);
+/// Poll while bundles are being held for a window more than a couple of slots away.
+const HOLD_POLL_PERIOD: Duration = Duration::from_millis(1);
 
 // Stats emitted periodically
 pub struct BundleStageLoopMetrics {
@@ -595,6 +607,32 @@ enum BundleExecutionError {
     ErrorNonRetryable,
 }
 
+/// What the last leader-state decision said, reduced to what the receive loop needs to pick
+/// its poll interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaderPhase {
+    /// A leader bank is live (or a slot of ours is, and its bank is about to be).
+    Leader,
+    /// Bundles are held for a window a couple of slots away.
+    Hold,
+    /// Bundles are held for a window further away than that.
+    ForwardAndHold,
+    /// No window in sight; the buffer is cleared.
+    Forward,
+}
+
+impl LeaderPhase {
+    /// How long the loop may wait for a bundle before it looks at the leader state again.
+    fn recv_timeout(self, bundles_buffered: bool) -> Duration {
+        match self {
+            Self::Leader if bundles_buffered => Duration::ZERO,
+            Self::Leader | Self::Hold => LEADER_POLL_PERIOD,
+            Self::ForwardAndHold => HOLD_POLL_PERIOD,
+            Self::Forward => SLOT_BOUNDARY_CHECK_PERIOD,
+        }
+    }
+}
+
 pub struct BundleStage {
     bundle_thread: JoinHandle<()>,
 }
@@ -738,7 +776,6 @@ impl BundleStage {
         bam_enabled: Arc<AtomicU8>,
         cluster_info: Arc<ClusterInfo>,
     ) {
-        let mut last_metrics_update = Instant::now();
         let ordering = BundleOrdering::from_env();
         info!("bundle stage ordering: {ordering:?}");
         let mut bundle_storage =
@@ -748,15 +785,16 @@ impl BundleStage {
         let consume_worker_metrics = ConsumeWorkerMetrics::new(10_000);
 
         let mut last_cranked_bank: Option<(Slot, BankId)> = None;
+        let mut phase = LeaderPhase::Forward;
         while !exit.load(Ordering::Relaxed) {
             let block_engine_processing =
                 Self::block_engine_processing_enabled(&bam_enabled, &mut bundle_storage);
 
-            if block_engine_processing
-                && (bundle_storage.unprocessed_bundles_len() > 0
-                    || last_metrics_update.elapsed() >= SLOT_BOUNDARY_CHECK_PERIOD)
-            {
-                let (_, process_buffered_packets_time_us) =
+            // The receive below waits no longer than the phase's poll period, so the
+            // leader state is read once per wake: a new bank is cranked within that
+            // period, buffered bundles run as soon as it exists.
+            if block_engine_processing {
+                let (new_phase, process_buffered_packets_time_us) =
                     measure_us!(Self::process_buffered_bundles(
                         &mut decision_maker,
                         &mut consumer,
@@ -772,16 +810,18 @@ impl BundleStage {
                 bundle_stage_metrics.increment_process_buffered_bundles_elapsed_us(
                     process_buffered_packets_time_us,
                 );
-                last_metrics_update = Instant::now();
+                phase = new_phase;
             }
 
             let start = Instant::now();
+            let recv_timeout = phase.recv_timeout(bundle_storage.unprocessed_bundles_len() > 0);
             if let Err(RecvTimeoutError::Disconnected) = Self::receive_and_buffer_bundles(
                 &bank_forks,
                 &mut bundle_receiver,
                 &mut bundle_storage,
                 &blacklisted_accounts,
                 &mut bundle_stage_metrics,
+                recv_timeout,
             ) {
                 break;
             }
@@ -829,21 +869,15 @@ impl BundleStage {
         bundle_storage: &mut BundleStorage,
         blacklisted_accounts: &HashSet<Pubkey>,
         bundle_stage_metrics: &mut BundleStageLoopMetrics,
+        recv_timeout: Duration,
     ) -> Result<(), RecvTimeoutError> {
+        let bundle = bundle_receiver.recv_timeout(recv_timeout)?;
         let (root_bank, working_bank) = {
             let bank_forks = bank_forks.read().unwrap();
             let root_bank = bank_forks.root_bank();
             let working_bank = bank_forks.working_bank();
             (root_bank, working_bank)
         };
-
-        let recv_timeout = if bundle_storage.unprocessed_bundles_len() > 0 {
-            Duration::from_millis(0)
-        } else {
-            Duration::from_millis(10)
-        };
-
-        let bundle = bundle_receiver.recv_timeout(recv_timeout)?;
         for bundle in std::iter::once(bundle).chain(bundle_receiver.try_iter()) {
             let num_packets = bundle.batch().len();
 
@@ -900,7 +934,7 @@ impl BundleStage {
         tip_managers: &TipManagers,
         cluster_info: &Arc<ClusterInfo>,
         consume_worker_metrics: &ConsumeWorkerMetrics,
-    ) {
+    ) -> LeaderPhase {
         match decision_maker.make_atomic_consume_or_forward_decision() {
             // BufferedPacketsDecision::Consume means this leader is scheduled to be running at the moment.
             // Execute, record, and commit as many bundles possible given time, compute, and other constraints.
@@ -918,6 +952,7 @@ impl BundleStage {
                     cluster_info,
                     consume_worker_metrics,
                 );
+                LeaderPhase::Leader
             }
             // BufferedPacketsDecision::Forward means the leader is slot is far away.
             // Bundles aren't forwarded because it breaks atomicity guarantees, so just drop them.
@@ -932,12 +967,18 @@ impl BundleStage {
                         as u64,
                 );
                 bundle_storage.clear();
+                LeaderPhase::Forward
             }
             // BufferedPacketsDecision::ForwardAndHold | BufferedPacketsDecision::Hold means the validator
             // is approaching the leader slot, hold bundles. Also, bundles aren't forwarded because it breaks
             // atomicity guarantees
-            BufferedPacketsDecision::ForwardAndHold | BufferedPacketsDecision::Hold => {
+            BufferedPacketsDecision::ForwardAndHold => {
                 bundle_stage_metrics.increment_decision_hold();
+                LeaderPhase::ForwardAndHold
+            }
+            BufferedPacketsDecision::Hold => {
+                bundle_stage_metrics.increment_decision_hold();
+                LeaderPhase::Hold
             }
         }
     }
@@ -2414,5 +2455,112 @@ mod tests {
             bundle_retry_duration(&bank_with_slot(Duration::from_millis(3_200))),
             MAX_BUNDLE_RETRY_DURATION
         );
+    }
+    #[test]
+    fn test_recv_timeout_follows_the_leader_phase() {
+        // Leader with work: no waiting at all.
+        assert_eq!(LeaderPhase::Leader.recv_timeout(true), Duration::ZERO);
+        // Leader with nothing buffered, or holding for an imminent window: a short poll, so
+        // a new bank is cranked and buffered bundles run within it.
+        assert_eq!(LeaderPhase::Leader.recv_timeout(false), LEADER_POLL_PERIOD);
+        assert_eq!(LeaderPhase::Hold.recv_timeout(true), LEADER_POLL_PERIOD);
+        assert_eq!(LeaderPhase::Hold.recv_timeout(false), LEADER_POLL_PERIOD);
+        // Holding for a window further away never spins, whatever is buffered.
+        assert_eq!(
+            LeaderPhase::ForwardAndHold.recv_timeout(true),
+            HOLD_POLL_PERIOD
+        );
+        assert!(LeaderPhase::ForwardAndHold.recv_timeout(true) > Duration::ZERO);
+        // Nothing in sight: the slow poll.
+        assert_eq!(
+            LeaderPhase::Forward.recv_timeout(false),
+            SLOT_BOUNDARY_CHECK_PERIOD
+        );
+    }
+
+    /// CPU time (user+system) of the thread named `name` in this process, from procfs.
+    #[cfg(target_os = "linux")]
+    fn thread_cpu_time(name: &str) -> Option<Duration> {
+        for task in std::fs::read_dir("/proc/self/task").ok()? {
+            let task = task.ok()?.path();
+            if std::fs::read_to_string(task.join("comm")).ok()?.trim() != name {
+                continue;
+            }
+            let stat = std::fs::read_to_string(task.join("stat")).ok()?;
+            // Fields after the parenthesised comm: state is field 3, utime 14, stime 15.
+            let rest = &stat[stat.rfind(')')? + 2..];
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            let ticks: u64 = fields[11].parse::<u64>().ok()? + fields[12].parse::<u64>().ok()?;
+            return Some(Duration::from_millis(ticks * 10));
+        }
+        None
+    }
+
+    /// Holding bundles for an imminent window must not spin: with the upstream zero
+    /// timeout the thread used 1.97s of CPU per 2s of wall time here; with the 500us poll
+    /// it uses 60ms.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_holding_bundles_does_not_spin() {
+        let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&GenesisConfig::default());
+        let migration_status = bank_forks.read().unwrap().migration_status();
+        let shared_leader_state = solana_poh::poh_recorder::SharedLeaderState::new(
+            0,
+            Some(24 * solana_clock::DEFAULT_TICKS_PER_SLOT),
+            Some((24, 27)),
+        );
+        let clock = SharedAlpenglowSlotClock::default();
+        let decision_maker =
+            DecisionMaker::new(shared_leader_state, migration_status.clone(), clock.clone());
+        migration_status.enable_alpenglow_for_tests();
+        clock.update(23, Instant::now(), Duration::from_secs(3600));
+        let (record_sender, _record_receiver) = solana_poh::record_channels::record_channels(false);
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let consumer = BundleConsumer::new(
+            Committer::new(None, replay_vote_sender, None),
+            TransactionRecorder::new(record_sender),
+            None,
+        );
+        let identity = Arc::new(Keypair::new());
+        let cluster_info = Arc::new(ClusterInfo::new(
+            ContactInfo::new_localhost(&identity.pubkey(), timestamp()),
+            identity,
+            SocketAddrSpace::Unspecified,
+        ));
+        let (sender, receiver) = bounded(16);
+        sender
+            .send(VerifiedPacketBundle::new(PacketBatch::from(vec![
+                BytesPacket::from_data(test_tx()).unwrap(),
+            ])))
+            .unwrap();
+        let exit = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let exit = exit.clone();
+            Builder::new()
+                .name("adhocHold".to_string())
+                .spawn(move || {
+                    BundleStage::process_loop(
+                        bank_forks,
+                        receiver,
+                        decision_maker,
+                        consumer,
+                        exit,
+                        HashSet::default(),
+                        BundleAccountLocker::default(),
+                        TipManagers::new(vec![TipManagerConfig::default()]),
+                        Arc::new(ArcSwap::from_pointee(BlockBuilderFeeInfo::default())),
+                        Arc::new(AtomicU8::new(BamConnectionState::Disconnected as u8)),
+                        cluster_info,
+                    )
+                })
+                .unwrap()
+        };
+        std::thread::sleep(Duration::from_secs(2));
+        let cpu = thread_cpu_time("adhocHold").unwrap();
+        exit.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+        drop(bank);
+        eprintln!("hold cpu over 2s wall: {cpu:?}");
+        assert!(cpu < Duration::from_millis(500), "cpu {cpu:?}");
     }
 }
