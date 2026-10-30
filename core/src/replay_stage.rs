@@ -2190,9 +2190,8 @@ impl ReplayStage {
                                 "Duplicate slot {duplicate_slot} repair exceeded \
                                  {MAX_REPAIR_RETRY_LOOP_ATTEMPTS} attempts (correct_hash \
                                  {correct_hash}, our hash {frozen_hash:?}). Resetting the counter \
-                                 and continuing because \
-                                 --dangerous-duplicate-slot-repair-bypass is set on a \
-                                 development cluster; a real cluster would exit here"
+                                 and continuing because --dangerous-duplicate-slot-repair-bypass \
+                                 is set on a development cluster; a real cluster would exit here"
                             );
                             purge_repair_slot_counter.remove(duplicate_slot);
                         } else {

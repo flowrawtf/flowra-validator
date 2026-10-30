@@ -1229,9 +1229,9 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .takes_value(true)
             .validator(is_parsable::<u64>)
             .help(
-                "Total in-flight compute units the block-production scheduler may hold across \
-                 all worker threads. The scheduler divides this by --block-production-num-workers \
-                 to get a per-thread quota, and a thread over quota cannot accept a transaction \
+                "Total in-flight compute units the block-production scheduler may hold across all \
+                 worker threads. The scheduler divides this by --block-production-num-workers to \
+                 get a per-thread quota, and a thread over quota cannot accept a transaction \
                  whose accounts it already holds locked. Leaving this at the default while \
                  raising the worker count therefore shrinks each thread's quota. Omit to track a \
                  quarter of the bank's block cost limit, which follows feature-gated limit \
@@ -1308,11 +1308,10 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .takes_value(true)
             .requires("upstream_tip_distribution_program_pubkey")
             .help(
-                "Public key of a SECOND tip-payment program to crank each leader slot. Set \
-                 this when accepting bundles relayed from an upstream block engine: those \
-                 bundles tip that engine's tip accounts, which belong to a different \
-                 tip-payment program. Without cranking it, those tips are swept to \
-                 whichever validator cranks it next.",
+                "Public key of a SECOND tip-payment program to crank each leader slot. Set this \
+                 when accepting bundles relayed from an upstream block engine: those bundles tip \
+                 that engine's tip accounts, which belong to a different tip-payment program. \
+                 Without cranking it, those tips are swept to whichever validator cranks it next.",
             ),
     )
     .arg(
@@ -1323,9 +1322,9 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .requires("upstream_tip_payment_program_pubkey")
             .help(
                 "Public key of the tip-distribution program paired with \
-                 --upstream-tip-payment-program-pubkey. The tip distribution account is \
-                 created under this program using the same vote account and commission as \
-                 the primary set, and --upstream-merkle-root-upload-authority.",
+                 --upstream-tip-payment-program-pubkey. The tip distribution account is created \
+                 under this program using the same vote account and commission as the primary \
+                 set, and --upstream-merkle-root-upload-authority.",
             ),
     )
     .arg(
@@ -1335,12 +1334,12 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .takes_value(true)
             .requires("upstream_tip_payment_program_pubkey")
             .help(
-                "Merkle root upload authority recorded in the upstream tip distribution \
-                 account. Only that key can upload the merkle root that pays out the \
-                 upstream tips. Defaults to Jito's TipRouter authority \
+                "Merkle root upload authority recorded in the upstream tip distribution account. \
+                 Only that key can upload the merkle root that pays out the upstream tips. \
+                 Defaults to Jito's TipRouter authority \
                  (8F4jGUmxF36vQ6yabnsxX6AQVXdKBhs8kGSUuRKSg8Xt), so Jito settles the upstream \
-                 tips as it does for any Jito validator. Set it only if you upload the \
-                 upstream merkle roots yourself.",
+                 tips as it does for any Jito validator. Set it only if you upload the upstream \
+                 merkle roots yourself.",
             ),
     )
     .arg(
@@ -1383,12 +1382,12 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("flowra-debug-telemetry")
             .takes_value(false)
             .help(
-                "Export metrics to the host named by SOLANA_METRICS_CONFIG. Off by default: \
-                 this fork carries extra instrumentation that is only useful to whoever is \
-                 debugging it, and without this flag the validator does not queue, serialize \
-                 or transmit a single data point, and opens no connection to a metrics host. \
-                 SOLANA_METRICS_CONFIG alone does nothing. FLOWRA_DEBUG_TELEMETRY=1 has the \
-                 same effect as passing this flag.",
+                "Export metrics to the host named by SOLANA_METRICS_CONFIG. Off by default: this \
+                 fork carries extra instrumentation that is only useful to whoever is debugging \
+                 it, and without this flag the validator does not queue, serialize or transmit a \
+                 single data point, and opens no connection to a metrics host. \
+                 SOLANA_METRICS_CONFIG alone does nothing. FLOWRA_DEBUG_TELEMETRY=1 has the same \
+                 effect as passing this flag.",
             ),
     )
     .arg(jito_args::shred_receiver_address())

@@ -1,11 +1,11 @@
 use {
     crate::{
+        GeneratedMerkleTreeCollection,
         jito_sdk::{
-            self,
+            self, AccountDeserialize,
             state::{ClaimStatus, Config, TipDistributionAccount},
-            AccountDeserialize,
         },
-        send_until_blockhash_expires, GeneratedMerkleTreeCollection,
+        send_until_blockhash_expires,
     },
     itertools::Itertools,
     log::{info, warn},
@@ -21,8 +21,8 @@ use {
         fee_calculator::DEFAULT_TARGET_LAMPORTS_PER_SIGNATURE, native_token::LAMPORTS_PER_SOL,
     },
     solana_pubkey::Pubkey,
-    solana_sdk_ids::system_program,
     solana_rpc_client_api::config::RpcSimulateTransactionConfig,
+    solana_sdk_ids::system_program,
     solana_signer::Signer,
     solana_transaction::Transaction,
     std::{
@@ -44,7 +44,10 @@ pub enum ClaimMevError {
     #[error(transparent)]
     RpcError(#[from] solana_rpc_client_api::client_error::Error),
 
-    #[error("Expected to have at least {desired_balance} lamports in {payer:?}. Current balance is {start_balance} lamports. Deposit {sol_to_deposit} SOL to continue.")]
+    #[error(
+        "Expected to have at least {desired_balance} lamports in {payer:?}. Current balance is \
+         {start_balance} lamports. Deposit {sol_to_deposit} SOL to continue."
+    )]
     InsufficientBalance {
         desired_balance: u64,
         payer: Pubkey,

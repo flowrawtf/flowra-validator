@@ -15,8 +15,8 @@ use {
         fmt::Write,
         panic::PanicHookInfo,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, Barrier, Mutex, Once, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
         thread,
         time::{Duration, Instant, UNIX_EPOCH},

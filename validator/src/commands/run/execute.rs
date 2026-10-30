@@ -813,9 +813,9 @@ pub fn execute(
     for arg in ["bundle_cu_reserve_pct", "bundle_reserve_release_pct"] {
         if matches.occurrences_of(arg) > 0 {
             warn!(
-                "--{} is deprecated and ignored — no block CU is reserved for bundles. \
-                 Bundles get their ordering from the block engine and their account locks \
-                 from BundleStage; remove the flag.",
+                "--{} is deprecated and ignored — no block CU is reserved for bundles. Bundles \
+                 get their ordering from the block engine and their account locks from \
+                 BundleStage; remove the flag.",
                 arg.replace('_', "-")
             );
         }
@@ -1716,8 +1716,7 @@ fn tip_manager_configs_from_matches(
                     .unwrap_or(JITO_TIP_ROUTER_MERKLE_ROOT_UPLOAD_AUTHORITY);
             info!(
                 "upstream tip programs enabled: payment={tip_payment_program_id} \
-                 distribution={tip_distribution_program_id} \
-                 merkle_root_upload_authority={}",
+                 distribution={tip_distribution_program_id} merkle_root_upload_authority={}",
                 upstream.merkle_root_upload_authority
             );
             configs.push(TipManagerConfig {
@@ -1730,8 +1729,8 @@ fn tip_manager_configs_from_matches(
         _ => {
             warn!(
                 "--upstream-tip-payment-program-pubkey and \
-                 --upstream-tip-distribution-program-pubkey must be given together; \
-                 upstream tip programs disabled"
+                 --upstream-tip-distribution-program-pubkey must be given together; upstream tip \
+                 programs disabled"
             );
         }
     }
@@ -1791,8 +1790,8 @@ mod upstream_tip_config_tests {
 
     fn configs(extra: &[&str]) -> Vec<TipManagerConfig> {
         let default_args = DefaultArgs::default();
-        let app = add_args(App::new("run"), &default_args)
-            .args(&thread_args(&default_args.thread_args));
+        let app =
+            add_args(App::new("run"), &default_args).args(&thread_args(&default_args.thread_args));
         let identity = tempfile::NamedTempFile::new().unwrap();
         solana_keypair::write_keypair_file(&Keypair::new(), identity.path()).unwrap();
         let identity = identity.path().to_str().unwrap().to_string();
@@ -1858,7 +1857,9 @@ mod upstream_tip_config_tests {
             &own_str,
         ]);
         assert_eq!(
-            configs[1].tip_distribution_account_config.merkle_root_upload_authority,
+            configs[1]
+                .tip_distribution_account_config
+                .merkle_root_upload_authority,
             own
         );
         assert_eq!(

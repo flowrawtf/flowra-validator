@@ -1,8 +1,9 @@
 use {
     crate::{
+        Config, StakeMeta, StakeMetaCollection, TipDistributionAccount,
+        TipDistributionAccountWrapper, TipDistributionMeta,
         derive_tip_distribution_account_address, derive_tip_payment_pubkeys,
-        jito_sdk::AccountDeserialize, Config, StakeMeta, StakeMetaCollection,
-        TipDistributionAccount, TipDistributionAccountWrapper, TipDistributionMeta,
+        jito_sdk::AccountDeserialize,
     },
     agave_snapshots::{paths::BANK_SNAPSHOTS_DIR, snapshot_config::SnapshotConfig},
     itertools::Itertools,
@@ -11,15 +12,13 @@ use {
     solana_accounts_db::utils::create_all_accounts_run_and_snapshot_dirs,
     solana_client::client_error::ClientError,
     solana_genesis_utils::{
-        open_genesis_config, OpenGenesisConfigError, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+        MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, OpenGenesisConfigError, open_genesis_config,
     },
     solana_ledger::{
         bank_forks_utils::{self, BankForksUtilsError},
         blockstore::{Blockstore, BlockstoreError},
         blockstore_options::{AccessType, BlockstoreOptions, LedgerColumnOptions},
-        blockstore_processor::{
-            self, BlockstoreProcessorError, ProcessOptions,
-        },
+        blockstore_processor::{self, BlockstoreProcessorError, ProcessOptions},
         leader_schedule_cache::LeaderScheduleCache,
     },
     solana_program::clock::Slot,
@@ -34,7 +33,7 @@ use {
         io::{BufWriter, Write},
         mem::size_of,
         path::{Path, PathBuf},
-        sync::{atomic::AtomicBool, Arc},
+        sync::{Arc, atomic::AtomicBool},
     },
     thiserror::Error,
 };
@@ -114,9 +113,10 @@ fn create_bank_from_snapshot(
 
     // Accounts must live under run/ + snapshot/ sub-dirs for snapshot extraction + bank-snapshot
     // hardlinking to work.
-    let (account_run_paths, _account_snapshot_paths) = create_all_accounts_run_and_snapshot_dirs(
-        &[PathBuf::from(ledger_path).join(Path::new("stake-meta.accounts"))],
-    )?;
+    let (account_run_paths, _account_snapshot_paths) =
+        create_all_accounts_run_and_snapshot_dirs(&[
+            PathBuf::from(ledger_path).join(Path::new("stake-meta.accounts"))
+        ])?;
 
     // Point the snapshot archive dirs at the ledger path (where a validator drops
     // `snapshot-<slot>-<hash>.tar.zst`). `SnapshotConfig::default()` is `usage: LoadOnly` with
@@ -227,9 +227,7 @@ pub fn generate_stake_meta_collection(
         .get_program_accounts(&solana_stake_interface::program::id())
         .expect("scan stake program accounts")
         .into_iter()
-        .filter_map(|(pubkey, account)| {
-            StakeAccount::try_from(account).ok().map(|sa| (pubkey, sa))
-        })
+        .filter_map(|(pubkey, account)| StakeAccount::try_from(account).ok().map(|sa| (pubkey, sa)))
         .collect();
 
     let voter_pubkey_to_delegations = group_delegations_by_voter_pubkey(&delegations, bank);
@@ -350,9 +348,10 @@ pub fn generate_stake_meta_collection(
             });
         } else {
             warn!(
-                    "voter_pubkey not found in voter_pubkey_to_delegations map [validator_vote_pubkey={}]",
-                    vote_pubkey
-                );
+                "voter_pubkey not found in voter_pubkey_to_delegations map \
+                 [validator_vote_pubkey={}]",
+                vote_pubkey
+            );
         }
     }
     stake_metas.sort();
@@ -418,15 +417,15 @@ mod tests {
         anchor_lang::AccountSerialize,
         jito_tip_distribution::state::TipDistributionAccount,
         jito_tip_payment::{
-            InitBumps, TipPaymentAccount, CONFIG_ACCOUNT_SEED, TIP_ACCOUNT_SEED_0,
-            TIP_ACCOUNT_SEED_1, TIP_ACCOUNT_SEED_2, TIP_ACCOUNT_SEED_3, TIP_ACCOUNT_SEED_4,
-            TIP_ACCOUNT_SEED_5, TIP_ACCOUNT_SEED_6, TIP_ACCOUNT_SEED_7,
+            CONFIG_ACCOUNT_SEED, InitBumps, TIP_ACCOUNT_SEED_0, TIP_ACCOUNT_SEED_1,
+            TIP_ACCOUNT_SEED_2, TIP_ACCOUNT_SEED_3, TIP_ACCOUNT_SEED_4, TIP_ACCOUNT_SEED_5,
+            TIP_ACCOUNT_SEED_6, TIP_ACCOUNT_SEED_7, TipPaymentAccount,
         },
         solana_account::AccountSharedData,
         solana_keypair::Keypair,
         solana_program::{message::Message, stake},
         solana_runtime::genesis_utils::{
-            create_genesis_config_with_vote_accounts, GenesisConfigInfo, ValidatorVoteKeypairs,
+            GenesisConfigInfo, ValidatorVoteKeypairs, create_genesis_config_with_vote_accounts,
         },
         solana_signer::Signer,
         solana_stake_interface::state::{Authorized, Lockup},

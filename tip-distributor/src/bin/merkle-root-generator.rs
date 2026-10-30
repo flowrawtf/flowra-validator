@@ -7,7 +7,7 @@ use {
     log::info,
     solana_client::rpc_client::RpcClient as SyncRpcClient,
     solana_tip_distributor::{
-        read_json_from_file, GeneratedMerkleTreeCollection, StakeMetaCollection,
+        GeneratedMerkleTreeCollection, StakeMetaCollection, read_json_from_file,
     },
     std::{
         fs::File,
@@ -44,9 +44,11 @@ fn main() {
 
     let maybe_rpc_client = args.rpc_url.map(SyncRpcClient::new);
 
-    let merkle_tree_coll =
-        GeneratedMerkleTreeCollection::new_from_stake_meta_collection(stake_meta_coll, maybe_rpc_client)
-            .expect("generate merkle tree collection");
+    let merkle_tree_coll = GeneratedMerkleTreeCollection::new_from_stake_meta_collection(
+        stake_meta_coll,
+        maybe_rpc_client,
+    )
+    .expect("generate merkle tree collection");
 
     let file = File::create(&args.out_path).expect("create out_path file");
     let mut writer = BufWriter::new(file);
