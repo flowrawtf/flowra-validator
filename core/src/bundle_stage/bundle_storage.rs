@@ -14,9 +14,9 @@ use {
     },
     ahash::HashSet,
     arrayvec::ArrayVec,
+    bytes::Bytes,
     smallvec::SmallVec,
     solana_clock::{BankId, Slot},
-    solana_perf::packet::bytes::Bytes,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_runtime_transaction::{
@@ -459,6 +459,7 @@ impl BundleStorage {
         }
 
         let mut container_ids = SmallVec::<[usize; 5]>::new();
+        let mut maybe_error = Ok(());
         let sanitize_config = sanitize_config();
         let transaction_account_lock_limit = working_bank
             .get_transaction_account_lock_limit()
@@ -466,29 +467,37 @@ impl BundleStorage {
 
         for (idx, packet) in batch.iter().enumerate() {
             // bundles shall contain all valid packets; checked above
-            let bytes = Bytes::copy_from_slice(packet.data(..).unwrap());
+            let packet_data = packet.data(..).unwrap();
 
             // try to insert the packet into the container
-            match TransactionViewReceiveAndBuffer::try_handle_packet(
-                bytes,
+            let insert_result = match TransactionViewReceiveAndBuffer::try_handle_packet(
+                Bytes::copy_from_slice(packet_data),
                 root_bank,
                 working_bank,
                 transaction_account_lock_limit,
                 &sanitize_config,
                 blacklisted_accounts,
             ) {
-                Ok(state) => {
-                    container_ids
-                        .push(self.transaction_view_state_container.insert_map_only(state));
-                }
+                Ok(state) => self
+                    .transaction_view_state_container
+                    .try_insert_map_only(state),
                 Err(e) => {
-                    // any error shall rollback any transactions added to the container
-                    for container_id in container_ids.iter() {
-                        self.transaction_view_state_container
-                            .remove_by_id(*container_id);
-                    }
-                    return Err(BundleStorageError::PacketFilterError((e, idx)));
+                    maybe_error = Err(e);
+                    None
                 }
+            };
+            if let Some(container_id) = insert_result {
+                container_ids.push(container_id);
+            } else {
+                // any error shall rollback any transactions added to the container
+                for container_id in container_ids.iter() {
+                    self.transaction_view_state_container
+                        .remove_by_id(*container_id);
+                }
+                return match maybe_error {
+                    Err(e) => Err(BundleStorageError::PacketFilterError((e, idx))),
+                    Ok(()) => Err(BundleStorageError::ContainerFull),
+                };
             }
         }
 

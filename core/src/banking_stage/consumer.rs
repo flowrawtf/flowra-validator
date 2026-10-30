@@ -685,7 +685,7 @@ impl Consumer {
     /// once the fee is taken: what it has left to fund the transaction itself.
     pub fn check_fee_payer_unlocked_with_remaining(
         bank: &Bank,
-        transaction: &impl TransactionWithMeta,
+        transaction: &impl StaticMessageWithMeta,
         error_counters: &mut TransactionErrorMetrics,
     ) -> Result<u64, TransactionError> {
         let fee_payer = transaction.fee_payer();
