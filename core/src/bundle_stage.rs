@@ -21,7 +21,7 @@ use {
         },
         packet_bundle::VerifiedPacketBundle,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
-        tip_manager::{TipManager, TipManagers},
+        tip_manager::{CrankStep, TipManager, TipManagers},
     },
     agave_votor::slot_clock::SharedAlpenglowSlotClock,
     ahash::HashSet,
@@ -1171,45 +1171,47 @@ impl BundleStage {
                 }
             };
 
-            for step in steps {
-                let _ = bundle_account_locker.lock_bundle(&step.txs, bank);
-                let max_ages: SmallVec<[MaxAge; 2]> = SmallVec::from_elem(
-                    MaxAge {
-                        sanitized_epoch: bank.epoch(),
-                        alt_invalidation_slot: bank.slot(),
-                    },
-                    step.txs.len(),
-                );
-                let output = consumer.process_and_record_aged_transactions(
-                    bank,
-                    &step.txs,
-                    &max_ages,
-                    bundle_retry_duration(bank),
-                );
-                let _ = bundle_account_locker.unlock_bundle(&step.txs, bank);
-                consume_worker_metrics.update_for_consume(&output);
-                consume_worker_metrics.set_has_data(true);
+            // A failing step with a fallback is retried as its split steps; a failing
+            // blocking step without one ends this program's chain, since later steps read
+            // what it was supposed to write.
+            CrankStep::run_chain(
+                steps,
+                &mut |step| {
+                    let _ = bundle_account_locker.lock_bundle(&step.txs, bank);
+                    let max_ages: SmallVec<[MaxAge; 2]> = SmallVec::from_elem(
+                        MaxAge {
+                            sanitized_epoch: bank.epoch(),
+                            alt_invalidation_slot: bank.slot(),
+                        },
+                        step.txs.len(),
+                    );
+                    let output = consumer.process_and_record_aged_transactions(
+                        bank,
+                        &step.txs,
+                        &max_ages,
+                        bundle_retry_duration(bank),
+                    );
+                    let _ = bundle_account_locker.unlock_bundle(&step.txs, bank);
+                    consume_worker_metrics.update_for_consume(&output);
+                    consume_worker_metrics.set_has_data(true);
 
-                match Self::to_bundle_result(&output) {
-                    Ok(()) => debug!("tip program {program} crank step {} ok", step.label),
-                    Err(e) => {
+                    let result = Self::to_bundle_result(&output);
+                    match &result {
+                        Ok(()) => debug!("tip program {program} crank step {} ok", step.label),
                         // The enum alone hides which transaction error actually fired, so
                         // surface the commit results too — this is the only place they exist.
-                        warn!(
+                        Err(e) => warn!(
                             "tip program {program} crank step {} failed: {e:?} results={:?}",
                             step.label,
                             output
                                 .execute_and_commit_transactions_output
                                 .commit_transactions_result
-                        );
-                        outcome.record_failure(primary, &e);
-                        if step.blocking {
-                            // Later steps read what this one was supposed to write.
-                            break;
-                        }
+                        ),
                     }
-                }
-            }
+                    result
+                },
+                &mut |_step, error| outcome.record_failure(primary, error),
+            );
         }
 
         outcome
@@ -1477,6 +1479,7 @@ mod tests {
         bank: &Bank,
         leader_keypair: &Keypair,
         vote_account: Pubkey,
+        block_builder_fee_info: &BlockBuilderFeeInfo,
     ) -> (
         bool,
         bool,
@@ -1509,14 +1512,7 @@ mod tests {
         let config_account_exists = bank
             .get_account(&tip_manager.tip_payment_config_pubkey())
             .is_some();
-        let crank = tip_manager.get_crank_steps(
-            bank,
-            leader_keypair,
-            &BlockBuilderFeeInfo {
-                block_builder: leader_keypair.pubkey(),
-                block_builder_commission: 0,
-            },
-        );
+        let crank = tip_manager.get_crank_steps(bank, leader_keypair, block_builder_fee_info);
 
         (init_executed_ok, config_account_exists, crank)
     }
@@ -1781,6 +1777,10 @@ mod tests {
             &bank,
             &leader_keypair,
             genesis_config_info.voting_keypair.pubkey(),
+            &BlockBuilderFeeInfo {
+                block_builder: leader_keypair.pubkey(),
+                block_builder_commission: 0,
+            },
         );
 
         assert!(init_committed_ok, "init transactions should commit");
@@ -1816,6 +1816,10 @@ mod tests {
             &bank,
             &leader_keypair,
             genesis_config_info.voting_keypair.pubkey(),
+            &BlockBuilderFeeInfo {
+                block_builder: leader_keypair.pubkey(),
+                block_builder_commission: 0,
+            },
         );
 
         assert!(init_committed_ok, "init transactions should commit");
@@ -1829,6 +1833,57 @@ mod tests {
             crank
                 .as_ref()
                 .map(|steps| steps.iter().map(|step| step.label).collect::<Vec<_>>())
+        );
+    }
+
+    #[test]
+    fn test_opening_crank_is_one_transaction_with_split_fallback() {
+        let TestFixture {
+            genesis_config_info,
+            leader_keypair,
+        } = create_genesis_config_with_rent(2, Rent::default(), FeeRateGovernor::new(0, 0));
+        let (bank, bank_forks) =
+            Bank::new_with_bank_forks_for_tests(&genesis_config_info.genesis_config);
+        let bank = Bank::new_from_parent(bank, SlotLeader::new_unique(), 1);
+        bank_forks.write().unwrap().insert(bank);
+        let bank = bank_forks.read().unwrap().working_bank();
+
+        // Freshly initialised, with a block builder other than the initialiser: the
+        // receiver and the block builder both need setting.
+        let (_, _, crank) = execute_tip_program_maintenance(
+            &bank,
+            &leader_keypair,
+            genesis_config_info.voting_keypair.pubkey(),
+            &BlockBuilderFeeInfo {
+                block_builder: Pubkey::new_unique(),
+                block_builder_commission: 10,
+            },
+        );
+        let steps = crank.unwrap();
+        let labels: Vec<_> = steps.iter().map(|step| step.label).collect();
+        assert_eq!(
+            labels,
+            [
+                "init_tip_distribution_account",
+                "change_tip_receiver_and_block_builder"
+            ]
+        );
+        let merged = &steps[1];
+        assert!(merged.blocking);
+        assert_eq!(merged.txs.len(), 1);
+        // Two instructions in one transaction: one execution, one PoH record.
+        assert_eq!(merged.txs[0].message().instructions().len(), 2);
+        let fallback: Vec<_> = merged
+            .fallback
+            .iter()
+            .map(|step| (step.label, step.blocking, step.txs.len()))
+            .collect();
+        assert_eq!(
+            fallback,
+            [
+                ("change_tip_receiver", true, 1),
+                ("change_block_builder", false, 1)
+            ]
         );
     }
 
@@ -1904,9 +1959,8 @@ mod tests {
         // initialize tip distribution config
         // initialize tip payment config
         // initialize tip distribution account
-        // change tip receiver
-        // change block builder
-        const NUM_TXS_EXPECTED: usize = 5;
+        // change tip receiver + change block builder, in one transaction
+        const NUM_TXS_EXPECTED: usize = 4;
         let mut tx_count = 0;
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(2) {
@@ -1917,6 +1971,7 @@ mod tests {
             }
             assert!(tx_count <= NUM_TXS_EXPECTED, "tx_count: {tx_count}");
         }
+        assert_eq!(tx_count, NUM_TXS_EXPECTED);
 
         let tip_payment_config_account = bank
             .get_account(&JitoTipPaymentConfig::find_program_address(&jito_tip_payment::id()).0)

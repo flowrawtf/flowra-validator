@@ -6,18 +6,19 @@ use {
         banking_stage::{committer::CommitTransactionDetails, consumer::Consumer},
         bundle_stage::bundle_account_locker::BundleAccountLocker,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
-        tip_manager::{TipManagerError, TipManagers},
+        tip_manager::{CrankChainResult, CrankStep, TipManagerError, TipManagers},
     },
     arc_swap::ArcSwap,
     jito_protos::proto::{
         bam_api::{SchedulerMessage, SchedulerMessageV0, scheduler_message::VersionedMsg},
         bam_types,
     },
-    smallvec::SmallVec,
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+    solana_transaction::sanitized::SanitizedTransaction,
     solana_transaction_error::TransactionError,
     solana_turbine::ShredReceiverAddresses,
     std::sync::RwLock,
@@ -123,18 +124,18 @@ impl TipProcessingDependencies {
             *last_error = Some((bank.slot(), error));
             false
         };
-        let mut process = |bundle: crate::tip_manager::Result<SmallVec<[_; 2]>>| {
-            let bundle = match bundle {
-                Ok(bundle) => bundle,
-                Err(error) => return fail(error.into()),
-            };
+        // Execute one crank stage. `Err(None)` is a retry without a cause to report.
+        let process = |bundle: &[RuntimeTransaction<SanitizedTransaction>]| -> std::result::Result<
+            (),
+            Option<TipProgramsError>,
+        > {
             if bundle.is_empty() {
-                return true;
+                return Ok(());
             }
             let results = consumer
                 .process_and_record_transactions_with_policy(
                     bank,
-                    &bundle,
+                    bundle,
                     Some(&self.bundle_account_locker),
                     true,
                 )
@@ -143,7 +144,7 @@ impl TipProcessingDependencies {
             debug!("tip bundle result for bank {bank_key:?}: {results:?}");
             // Recording opens after this Bank is published and closes before it ends; retry.
             let Ok(results) = results else {
-                return false;
+                return Err(None);
             };
             // A reverted bundle marks its other transactions CommitCancelled; report the cause.
             let Some(error) = results
@@ -154,9 +155,9 @@ impl TipProcessingDependencies {
                 })
                 .min_by_key(|error| *error == TransactionError::CommitCancelled)
             else {
-                return true;
+                return Ok(());
             };
-            fail(error.into())
+            Err(Some(error.into()))
         };
         // Each program is cranked on its own. Only our own (primary) program gates BAM
         // admission; an upstream program we cannot crank is logged and must not cost us
@@ -165,29 +166,33 @@ impl TipProcessingDependencies {
         for (i, tip_manager) in self.tip_managers.iter().enumerate() {
             let program = tip_manager.tip_payment_program_id();
             // Crank construction reads the accounts created by initialization; keep it lazy.
-            let ok = process(tip_manager.get_initialize_tip_programs_bundle(bank, &keypair))
-                && match tip_manager.get_crank_steps(bank, &keypair, builder) {
-                    Ok(steps) => {
-                        let mut steps_ok = true;
-                        for step in steps {
-                            if !process(Ok(step.txs)) {
-                                warn!(
-                                    "tip program {program} crank step {} did not commit",
-                                    step.label
-                                );
-                                steps_ok = false;
-                                if step.blocking {
-                                    break;
-                                }
+            let ok = match tip_manager.get_initialize_tip_programs_bundle(bank, &keypair) {
+                Ok(init) => match process(&init) {
+                    Ok(()) => true,
+                    Err(error) => error.is_some_and(&mut fail),
+                },
+                Err(error) => fail(error.into()),
+            } && match tip_manager.get_crank_steps(bank, &keypair, builder) {
+                Ok(steps) => {
+                    CrankStep::run_chain(
+                        steps,
+                        &mut |step| process(&step.txs),
+                        &mut |step, error| {
+                            warn!(
+                                "tip program {program} crank step {} did not commit: {error:?}",
+                                step.label
+                            );
+                            if let Some(error) = error {
+                                fail(error.clone());
                             }
-                        }
-                        steps_ok
-                    }
-                    Err(e) => {
-                        error!("tip program {program} crank could not be built: {e:?}");
-                        false
-                    }
-                };
+                        },
+                    ) == CrankChainResult::Committed
+                }
+                Err(error) => {
+                    error!("tip program {program} crank could not be built: {error:?}");
+                    fail(error.into())
+                }
+            };
             if !ok && i == 0 {
                 primary_ok = false;
             }
