@@ -45,7 +45,7 @@ use {
         num::{NonZeroUsize, Saturating},
         sync::{
             Arc, RwLock,
-            atomic::{AtomicBool, AtomicU8, Ordering},
+            atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         },
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
@@ -1142,6 +1142,16 @@ impl BundleStage {
         let keypair = cluster_info.keypair();
         let bb_info = block_builder_fee_info.load();
         let mut outcome = TipCrankOutcome::default();
+        let block_builder_known = Self::block_builder_known(&bb_info);
+        if !block_builder_known {
+            // Polled until the crank succeeds; say it once per slot.
+            static LAST_WARNED_SLOT: AtomicU64 = AtomicU64::new(u64::MAX);
+            if LAST_WARNED_SLOT.swap(bank.slot(), Ordering::Relaxed) != bank.slot() {
+                warn!(
+                    "block builder fee info not received yet; tip crank waits for the block engine"
+                );
+            }
+        }
 
         // Programs are cranked independently: a program we cannot crank (wrong config, an
         // upstream program we do not fully control) must not stop us cranking the others.
@@ -1159,6 +1169,14 @@ impl BundleStage {
             ) {
                 warn!("tip program {program} initialize failed: {e:?}");
                 outcome.record_failure(primary, &e);
+                continue;
+            }
+
+            // Until the block engine publishes its builder, the fee info holds the default
+            // pubkey: the system program, which the crank must pass writable and the runtime
+            // demotes to read-only (ConstraintMut). Wait for it, as upstream does.
+            if !block_builder_known {
+                outcome.record_failure(primary, &BundleExecutionError::ErrorRetryable);
                 continue;
             }
 
@@ -1215,6 +1233,12 @@ impl BundleStage {
         }
 
         outcome
+    }
+
+    /// Whether the block engine has sent a block builder yet. Before that the fee info is
+    /// `Default`, whose pubkey is the system program.
+    fn block_builder_known(info: &BlockBuilderFeeInfo) -> bool {
+        info.block_builder != Pubkey::default()
     }
 
     fn handle_initialize_tip_programs(
@@ -1745,6 +1769,17 @@ mod tests {
         outcome.record_failure(true, &BundleExecutionError::ErrorRetryable);
         assert_eq!(outcome.failures, 1);
         assert!(outcome.hold_bundles());
+    }
+
+    #[test]
+    fn test_default_block_builder_is_not_cranked() {
+        assert!(!BundleStage::block_builder_known(
+            &BlockBuilderFeeInfo::default()
+        ));
+        assert!(BundleStage::block_builder_known(&BlockBuilderFeeInfo {
+            block_builder: Pubkey::new_unique(),
+            block_builder_commission: 0,
+        }));
     }
 
     #[test]
