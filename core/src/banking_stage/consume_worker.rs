@@ -3527,7 +3527,8 @@ mod tests {
     #[test_case("recording", None)]
     #[test_case("cost", Some(TransactionError::WouldExceedMaxBlockCostLimit.into()))]
     #[test_case("account_lock", Some(TransactionError::AccountInUse.into()))]
-    #[test_case("execution", custom(1, 0x1771))]
+    // The block builder changes on its own, so its instruction is the first of its step.
+    #[test_case("execution", custom(0, 0x1771))]
     #[test_case("underfunded", custom(0, 0x1))]
     #[test_case("rotated", custom(0, 0x177e))]
     fn test_tip_preparation_failure_is_retryable(failure: &str, error: Option<TipProgramsError>) {
@@ -3577,7 +3578,10 @@ mod tests {
                 .set_limits(CostTrackerLimits::new(u64::MAX, cost, u64::MAX)),
             "underfunded" | "rotated" => {
                 // A new blockhash lets this epoch's tip distribution account be created again.
-                let tda = tips.tip_manager.get_my_tip_distribution_pda(bank.epoch());
+                let tda = tips
+                    .tip_managers
+                    .primary()
+                    .get_my_tip_distribution_pda(bank.epoch());
                 bank.store_account(&tda, &AccountSharedData::default());
                 bank.register_unique_recent_blockhash_for_test();
                 if failure == "rotated" {
@@ -3631,7 +3635,13 @@ mod tests {
             &tips.block_builder_fee_info.load(),
             &mut last_error,
         ));
-        assert_eq!(frame.record_receiver.drain().count(), 1);
+        // One record per crank step: recreating the tip distribution account is its own.
+        let steps = if matches!(failure, "underfunded" | "rotated") {
+            2
+        } else {
+            1
+        };
+        assert_eq!(frame.record_receiver.drain().count(), steps);
         assert!(tips.process_tip_programs(
             &worker.consumer,
             bank,

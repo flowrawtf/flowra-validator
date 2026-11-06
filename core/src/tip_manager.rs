@@ -512,14 +512,7 @@ impl TipManager {
             &[keypair],
             bank.last_blockhash(),
         ));
-        RuntimeTransaction::try_create(
-            tx,
-            MessageHash::Compute,
-            None,
-            bank,
-            bank.get_reserved_account_keys(),
-        )
-        .unwrap()
+        Self::runtime_transaction(tx, bank)
     }
 
     /// Point the tip-payment program's global tip receiver at `new_tip_receiver`. The

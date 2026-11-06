@@ -693,7 +693,8 @@ fn try_schedule_transaction<Tx: TransactionWithMeta>(
     let read_account_locks = account_keys
         .iter()
         .enumerate()
-        .filter_map(|(index, key)| (!transaction.is_writable(index)).then_some(key));
+        .filter_map(|(index, key)| (!transaction.is_writable(index)).then_some(key))
+        .chain(transaction.implicit_read_locks());
 
     // Check bundle account locks doesn't have it yet
     let l_account_locks = bundle_account_locker.account_locks();

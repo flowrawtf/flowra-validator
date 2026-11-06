@@ -609,7 +609,7 @@ mod test {
         // Each transaction costs 5000 CU. Filling worker 0 forces the second transaction
         // to try worker 1. With no explicit ProgramData, only the implicit read blocks it.
         let config = GreedySchedulerConfig {
-            target_scheduled_cus: 10_000,
+            target_scheduled_cus: Some(10_000),
             ..GreedySchedulerConfig::default()
         };
         let (mut scheduler, receivers, finished) = create_test_frame(2, config);
